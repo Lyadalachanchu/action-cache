@@ -1,0 +1,79 @@
+=== Minimal patch instructions ===
+
+1) Initialize DB early (e.g., in main.py before creating your agent):
+--------------------------------------------------------------------
+from cachedb.db import init_db
+init_db()
+
+# Optional: migrate existing JSON caches once at startup
+try:
+    from cachedb.migrate_from_json import run as migrate_run
+    migrate_run()
+except Exception as e:
+    print("Migration skipped:", e)
+
+
+2) Replace old imports with adapters (examples):
+-----------------------------------------------
+# BEFORE (examples from your codebase):
+# from answer_cache import AnswerCache
+# from plan_store import PlanStore
+# from utils import LLMCache
+
+# AFTER:
+from cachedb_integrations.cache_adapters import (
+    AnswerCacheAdapter as AnswerCache,
+    PlanStoreAdapter as PlanStore,
+    LLMCacheAdapter as LLMCache,
+)
+
+# This keeps your downstream code mostly unchanged if you instantiate the same names.
+
+
+3) Example usage inside agent.py / utils.py:
+--------------------------------------------
+answer_cache = AnswerCache()
+plan_store = PlanStore()
+llm_cache = LLMCache()
+
+# Answers
+hit = answer_cache.get("When was Marie Curie born?")
+if hit:
+    print("Cached:", hit["answer_text"])
+
+# Plans
+plan = plan_store.approx_get("Find a person's birth date on Wikipedia", site_domain="wikipedia.org")
+if plan:
+    for step in plan["plan_json"].get("actions", []):
+        pass
+
+# LLM cache
+maybe = llm_cache.approx_get("Summarize: ...")
+if not maybe:
+    # ... call LLM ...
+    llm_cache.put(model="gpt-4o", prompt="Summarize: ...", text="...", usage={"tokens": 123})
+
+
+4) Python version note:
+-----------------------
+If you previously got `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'`,
+it's due to `dict | None` union types on Python < 3.10. These adapters run fine on Python 3.8+,
+but if you keep `| None` in your own code, switch to `Optional[dict]` or upgrade to Python 3.10+.
+
+
+5) Optional: DOM role recovery (if you use DOM heuristics):
+-----------------------------------------------------------
+from cachedb.resolver import robust_click_hint
+candidates = robust_click_hint("infobox birth date", site_domain="wikipedia.org")
+# try candidates[0]['selector'] first, then fall back.
+
+
+6) Environment variables (optional):
+------------------------------------
+# Use real embeddings if you want (otherwise offline deterministic embeddings are used)
+export OPENAI_API_KEY=...
+
+# Tweak thresholds if needed (defaults are sane)
+export COSINE_THRESHOLD_PROMPT=0.97
+export COSINE_THRESHOLD_QA=0.92
+export COSINE_THRESHOLD_PLAN=0.88
