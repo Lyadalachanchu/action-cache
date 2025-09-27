@@ -16,7 +16,7 @@ import time
 
 from cachedb.resolver import get_answer, get_plan
 from cachedb.repos import AnswersRepo, PlansRepo, LLMRepo
-from cachedb.migrate_from_json import canonicalize
+from cachedb.migrate_from_json import canonicalize as _legacy_canonicalize
 
 # ---------------------------- Answer Cache -----------------------------------
 
@@ -33,7 +33,12 @@ class AnswerCacheAdapter:
             confidence: float = 1.0,
             freshness_horizon: Optional[int] = None,
             evidence: Optional[Dict[str, Any]] = None) -> int:
-        cq = canonicalize(question)
+        try:
+            from t_agent import improved_canonicalize as _canonicalize  # local import to avoid circular deps
+        except Exception:
+            _canonicalize = _legacy_canonicalize
+
+        cq = _canonicalize(question)
         return self.repo.put(
             canonical_q=cq,
             question_text=question,

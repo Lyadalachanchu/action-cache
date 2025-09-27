@@ -359,7 +359,9 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                     "- goto: {\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/PageName\"}\n"
                     "- read_page: {\"action\": \"read_page\"}\n"
                     "- scroll: {\"action\": \"scroll\", \"direction\": \"up\" or \"down\"}\n"
-                    "Only use wikipedia.org URLs. Use the actual person/entity names in URLs, not placeholders like PERSON."
+                    "Only use wikipedia.org URLs. Use the actual person/entity names in URLs, not placeholders like PERSON. "
+                    "Group all actions needed for the same page inside a single subgoal and keep the total number of subgoals to the minimum required. "
+                    "Do not include a scroll action unless it is truly needed to reach information that cannot be read immediately."
                 )
             },
             {
@@ -385,7 +387,20 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                             fixed_actions.append(fixed_action)
                     subgoal["actions"] = fixed_actions
 
-            return subgoals
+            cleaned_subgoals: List[Dict[str, Any]] = []
+            for subgoal in subgoals:
+                actions = subgoal.get("actions", [])
+                if not actions:
+                    continue  # drop empty subgoals
+
+                if all(act.get("action") == "scroll" for act in actions) and cleaned_subgoals:
+                    # Merge pure scrolling steps into the previous subgoal so we don't create redundant subgoals.
+                    cleaned_subgoals[-1]["actions"].extend(actions)
+                    continue
+
+                cleaned_subgoals.append(subgoal)
+
+            return cleaned_subgoals
 
         except Exception as e:
             print(f"❌ Plan creation failed: {e}")
@@ -395,6 +410,7 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
         """Main execution method with robust error handling"""
         global EXECUTION_START_TIME, TOTAL_EXECUTION_TIME
         EXECUTION_START_TIME = time.time()
+        RUN_TOKENS["prompt"] = RUN_TOKENS["completion"] = RUN_TOKENS["total"] = 0
 
         print(f"\n🚀 STARTING AUTOMATION: {goal}")
         print("=" * 60)
@@ -465,7 +481,7 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
             canonical_intent = improved_canonicalize(goal)
             plan_store.put(
                 intent_key=canonical_intent,  # Use canonicalized key to prevent wrong matches
-                goal_text=goal,
+                goal_text=canonical_intent,
                 plan_json={"subgoals": subgoals},
                 site_domain="wikipedia.org"
             )
