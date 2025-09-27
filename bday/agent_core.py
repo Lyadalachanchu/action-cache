@@ -8,7 +8,7 @@ from playwright.async_api import async_playwright
 
 # ===================== Globals =====================
 STRICT_WIKI_ONLY = True
-MAX_PAGE_TEXT_CHARS = 18000
+MAX_PAGE_TEXT_CHARS = 100000
 WIKI_HOME = "https://en.wikipedia.org"
 WIKI_SEARCH = WIKI_HOME + "/w/index.php?search="
 
