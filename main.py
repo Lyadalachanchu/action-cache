@@ -5,6 +5,9 @@ import json
 from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+import weaviate
+from weaviate.classes.init import Auth
+from weaviate.classes.config import Property, DataType, Configure
 
 load_dotenv()
 
@@ -16,7 +19,58 @@ class LLMBrowserAgent:
         self.subgoals = []
         self.current_subgoal_index = 0
         self.collected_information = []  # Store info from each subgoal
+        
+        # Initialize Weaviate connection
+        self.weaviate_client = None
+        self.tasks_collection = None
+        self._setup_weaviate()
     
+    def _setup_weaviate(self):
+        """Setup Weaviate connection and create/connect to tasks collection"""
+        try:
+            weaviate_url = os.getenv('WEAVIATE_URL')
+            weaviate_api_key = os.getenv('WEAVIATE_API_KEY')
+            
+            if not weaviate_url or not weaviate_api_key:
+                print("⚠️  Weaviate credentials not found. Subtask tracking disabled.")
+                return
+            
+            self.weaviate_client = weaviate.connect_to_weaviate_cloud(
+                cluster_url=weaviate_url,
+                auth_credentials=Auth.api_key(weaviate_api_key),
+            )
+            
+            # Delete existing collection if it exists and create new one
+            try:
+                self.weaviate_client.collections.delete("Subtask")
+                print("🗑️  Deleted existing Subtask collection")
+            except:
+                pass  # Collection doesn't exist, that's fine
+            
+            self.tasks_collection = self.weaviate_client.collections.create(
+                name="Subtask",
+                properties=[
+                    Property(name="task", data_type=DataType.TEXT),
+                    Property(name="actions", data_type=DataType.TEXT_ARRAY),
+                    Property(name="description", data_type=DataType.TEXT),
+                    Property(name="subgoal_id", data_type=DataType.INT),
+                ],
+                vector_config=[
+                    Configure.Vectors.text2vec_openai(
+                        name="task_embedding",
+                        source_properties=["task"],
+                        model="text-embedding-3-large",
+                        dimensions=1024
+                    )
+                ],
+            )
+            print("✅ Weaviate connection established")
+            
+        except Exception as e:
+            print(f"❌ Failed to setup Weaviate: {e}")
+            self.weaviate_client = None
+            self.tasks_collection = None
+
     async def check_browser_health(self):
         """Check if the browser is still accessible"""
         try:
@@ -882,6 +936,68 @@ class LLMBrowserAgent:
         
         return False
     
+    def save_subtask_to_weaviate(self, subgoal):
+        """Save a subtask to Weaviate for future reference"""
+        if not self.tasks_collection:
+            print("⚠️  Weaviate not available - skipping subtask save")
+            return None
+        
+        try:
+            # Prepare data for Weaviate
+            weaviate_data = {
+                "task": subgoal["title"],
+                "actions": [json.dumps(action) for action in subgoal["actions"]],
+                "description": subgoal["description"],
+                "subgoal_id": subgoal["id"]
+            }
+            
+            # Insert into collection
+            result = self.tasks_collection.data.insert(weaviate_data)
+            print(f"💾 Saved subtask: {subgoal['title']} (ID: {result})")
+            return result
+            
+        except Exception as e:
+            print(f"❌ Failed to save subtask: {e}")
+            return None
+    
+    def search_similar_subtasks(self, query, limit=3):
+        """Search for similar subtasks in Weaviate"""
+        if not self.tasks_collection:
+            print("⚠️  Weaviate not available - skipping subtask search")
+            return []
+        
+        try:
+            response = self.tasks_collection.query.near_text(
+                query=query,
+                limit=limit,
+                return_metadata=["certainty"]
+            )
+            
+            similar_tasks = []
+            for obj in response.objects:
+                similarity = obj.metadata.certainty if obj.metadata else 0.0
+                similar_tasks.append({
+                    "task": obj.properties['task'],
+                    "actions": obj.properties['actions'],
+                    "description": obj.properties['description'],
+                    "similarity": similarity
+                })
+            
+            return similar_tasks
+            
+        except Exception as e:
+            print(f"❌ Failed to search subtasks: {e}")
+            return []
+    
+    def close_weaviate_connection(self):
+        """Close Weaviate connection"""
+        if self.weaviate_client:
+            try:
+                self.weaviate_client.close()
+                print("🔌 Weaviate connection closed")
+            except Exception as e:
+                print(f"⚠️  Error closing Weaviate: {e}")
+    
     async def run_automation(self, user_goal, max_steps=30):
         """Run the LLM-driven browser automation"""
         print(f"\n🚀 STARTING AUTOMATION")
@@ -892,6 +1008,11 @@ class LLMBrowserAgent:
         if not await self.create_subgoals_and_actions(user_goal):
             print("❌ Planning phase failed. Ending automation.")
             return
+        
+        # Save all subgoals to Weaviate for future reference
+        print("\n💾 SAVING SUBTASKS TO WEAVIATE...")
+        for subgoal in self.subgoals:
+            self.save_subtask_to_weaviate(subgoal)
         
         print(f"\n🎬 EXECUTION PHASE: Following the plan...")
         print("=" * 60)
@@ -992,9 +1113,16 @@ async def main():
                 # user_goal = "When did the Crisis of the Roman Republic end?"
                 # user_goal = "Explain how the concept of 'justice' differs between Aristotelian philosophy, Confucian ethics, and Islamic jurisprudence, with specific examples."
                 # user_goal = "Explain how the concept of 'justice' differs between Aristotelian philosophy and Confucian ethics with specific examples."
+                
+                # First question
                 user_goal = "Is Chris Martin younger than Matt Damon?"
-
+                print(f"\n🎯 RUNNING FIRST QUESTION: {user_goal}")
                 await agent.run_automation(user_goal)
+                
+                # Follow-up question
+                follow_up_goal = "How old is Chris Martin?"
+                print(f"\n🎯 RUNNING FOLLOW-UP QUESTION: {follow_up_goal}")
+                await agent.run_automation(follow_up_goal)
             else:
                 print("Skipping LLM automation - add OPENAI_API_KEY to .env file")
                 print("Add your OpenAI API key to the .env file to enable LLM automation")
@@ -1005,6 +1133,9 @@ async def main():
         
         finally:
             try:
+                # Close Weaviate connection
+                agent.close_weaviate_connection()
+                
                 await browser.close()
                 print("Browser closed successfully!")
             except Exception as e:
