@@ -29,10 +29,20 @@ if weaviate_url and weaviate_api_key:
             timeout=wvc.Timeout(init=30)  # Increase timeout
         )
         
+        # Get OpenAI API key for vectorizer
+        openai_api_key = os.getenv("OPENAI_TOKEN")
+        headers = {}
+        if openai_api_key:
+            headers["X-OpenAI-Api-Key"] = openai_api_key
+            print(f"✅ OpenAI API key found and will be used for vectorization")
+        else:
+            print("⚠️  No OPENAI_TOKEN found - vectorization may fail")
+        
         client = weaviate.connect_to_weaviate_cloud(
             cluster_url=weaviate_url, 
             auth_credentials=AuthApiKey(weaviate_api_key),
             additional_config=additional_config,
+            headers=headers,
             skip_init_checks=True  # Skip gRPC health checks
         )
         print("Successfully connected to Weaviate Cloud!")
@@ -40,7 +50,16 @@ if weaviate_url and weaviate_api_key:
         print(f"Failed to connect to Weaviate Cloud: {e}")
         print("Falling back to local connection...")
         try:
-            client = weaviate.connect_to_local()
+            # Get OpenAI API key for vectorizer
+            openai_api_key = os.getenv("OPENAI_TOKEN")
+            headers = {}
+            if openai_api_key:
+                headers["X-OpenAI-Api-Key"] = openai_api_key
+                print(f"✅ OpenAI API key found and will be used for vectorization")
+            else:
+                print("⚠️  No OPENAI_TOKEN found - vectorization may fail")
+            
+            client = weaviate.connect_to_local(headers=headers)
             print("Successfully connected to local Weaviate!")
         except Exception as local_e:
             print(f"Failed to connect to local Weaviate: {local_e}")
@@ -49,7 +68,16 @@ if weaviate_url and weaviate_api_key:
 else:
     print("No Weaviate Cloud credentials found. Trying local connection...")
     try:
-        client = weaviate.connect_to_local()
+        # Get OpenAI API key for vectorizer
+        openai_api_key = os.getenv("OPENAI_TOKEN")
+        headers = {}
+        if openai_api_key:
+            headers["X-OpenAI-Api-Key"] = openai_api_key
+            print(f"✅ OpenAI API key found and will be used for vectorization")
+        else:
+            print("⚠️  No OPENAI_TOKEN found - vectorization may fail")
+        
+        client = weaviate.connect_to_local(headers=headers)
         print("Successfully connected to local Weaviate!")
     except Exception as e:
         print(f"Failed to connect to local Weaviate: {e}")
@@ -75,14 +103,9 @@ print("\nCreating Task collection...")
 ensure_drop("Task")
 client.collections.create(
     name="Task",
-    vector_config=[
-        Configure.Vectors.text2vec_openai(
-            name="title_vector",
-            source_properties=["title"],
-            model="text-embedding-3-large",
-            dimensions=1024
-        )
-    ],
+    vectorizer_config=wc.Configure.Vectorizer.text2vec_openai(
+        model="text-embedding-3-large"
+    ),
     properties=[
         wc.Property(name="title", data_type=wc.DataType.TEXT),
     ],
@@ -149,70 +172,64 @@ for action in actions:
 
 print(f"✅ All {len(actions)} Actions inserted successfully!")
 
+def create_task(title, action_names, action_uuids, task_collection):
+    """
+    Create a task with the given title and actions.
+    
+    Args:
+        title (str): The title of the task
+        action_names (list): List of action names to include in the task
+        action_uuids (dict): Dictionary mapping action names to their UUIDs
+        task_collection: The Weaviate Task collection object
+    
+    Returns:
+        str: The UUID of the created task
+    """
+    # Get the UUIDs for the specified actions
+    action_refs = [action_uuids[name] for name in action_names if name in action_uuids]
+    
+    # Create the task
+    task_uuid = task_collection.data.insert(
+        properties={"title": title},
+        references={"actions": action_refs},
+        uuid=uuid.uuid5(uuid.NAMESPACE_URL, f"task:{title.lower().replace(' ', '_')}:v1").hex
+    )
+    
+    print(f"✅ Created task: {title} with {len(action_refs)} actions")
+    return task_uuid
+
 # --- Insert Example Tasks ---
 print("\nInserting example Tasks...")
 Task = client.collections.get("Task")
 
-# Task 1: Search for celebrity birth date
-task_search_actions = [
-    action_uuids["goto"],
-    action_uuids["type"],
-    action_uuids["press_enter"],
-    action_uuids["wait"],
-    action_uuids["read_page"],
-    action_uuids["done"]
+# Create example tasks using the new function
+example_tasks = [
+    {
+        "title": "Search for celebrity birth date",
+        "actions": ["goto", "type", "press_enter", "wait", "read_page", "done"]
+    },
+    {
+        "title": "Fill out contact form", 
+        "actions": ["goto", "type", "type", "type", "click", "wait", "done"]
+    },
+    {
+        "title": "Navigate and scroll through page",
+        "actions": ["goto", "wait", "scroll", "wait", "scroll", "read_page", "done"]
+    }
 ]
 
-task_search = {
-    "title": "Search for celebrity birth date"
-}
-
-# Task 2: Fill out a contact form
-task_form_actions = [
-    action_uuids["goto"],
-    action_uuids["type"],
-    action_uuids["type"],
-    action_uuids["type"],
-    action_uuids["click"],
-    action_uuids["wait"],
-    action_uuids["done"]
-]
-
-task_form = {
-    "title": "Fill out contact form"
-}
-
-# Task 3: Navigate and scroll through content
-task_scroll_actions = [
-    action_uuids["goto"],
-    action_uuids["wait"],
-    action_uuids["scroll"],
-    action_uuids["wait"],
-    action_uuids["scroll"],
-    action_uuids["read_page"],
-    action_uuids["done"]
-]
-
-task_scroll = {
-    "title": "Navigate and scroll through page"
-}
-
-# Insert all tasks
-tasks_data = [
-    (task_search, task_search_actions),
-    (task_form, task_form_actions),
-    (task_scroll, task_scroll_actions)
-]
-
-for task_data, actions_refs in tasks_data:
-    Task.data.insert(
-        properties=task_data,
-        references={"actions": actions_refs},
-        uuid=uuid.uuid5(uuid.NAMESPACE_URL, f"task:{task_data['title'].lower().replace(' ', '_')}:v1").hex
+# Create all tasks using the function
+created_tasks = []
+for task_config in example_tasks:
+    task_uuid = create_task(
+        title=task_config["title"],
+        action_names=task_config["actions"],
+        action_uuids=action_uuids,
+        task_collection=Task
     )
-    print(f"✅ Inserted task: {task_data['title']}")
+    created_tasks.append(task_uuid)
 
-print(f"✅ All {len(tasks_data)} Tasks inserted successfully!")
+print(f"✅ All {len(created_tasks)} Tasks created successfully!")
 
 print("\n🎉 Collections created with text-embedding-3-large and sample objects inserted.")
 client.close()
