@@ -1,0 +1,199 @@
+{
+  "wikipedia_birth_date:was_napoleon_born": {
+    "goal": "When was Napoleon born?",
+    "subgoals": [
+      {
+        "id": 1,
+        "title": "Search for Napoleon on Wikipedia",
+        "description": "Use the Wikipedia search to find the Napoleon Bonaparte page",
+        "actions": [
+          {
+            "action": "type",
+            "parameters": {
+              "selector": "#searchInput",
+              "text": "Napoleon Bonaparte"
+            }
+          },
+          {
+            "action": "press_enter",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Open the Napoleon Bonaparte article",
+        "description": "Click the first result to open the Napoleon Bonaparte page",
+        "actions": [
+          {
+            "action": "click",
+            "parameters": {
+              "selector": "li.mw-search-result a"
+            }
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Extract birth date information",
+        "description": "Read the article and extract the birth date of Napoleon Bonaparte",
+        "actions": [
+          {
+            "action": "read_page",
+            "parameters": {}
+          }
+        ]
+      }
+    ]
+  },
+  "wikipedia_research:explain_'justice'_differs_between_aristotelian_philosophy": {
+    "goal": "Explain how 'justice' differs between Aristotelian philosophy, Confucian ethics, and Islamic jurisprudence.",
+    "subgoals": [
+      {
+        "id": 1,
+        "title": "Search for 'Justice in Aristotelian philosophy'",
+        "description": "Use the Wikipedia search to find information about justice in Aristotelian philosophy",
+        "actions": [
+          {
+            "action": "type",
+            "parameters": {
+              "selector": "#searchInput",
+              "text": "Justice in Aristotelian philosophy"
+            }
+          },
+          {
+            "action": "press_enter",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Extract information about 'Justice in Aristotelian philosophy'",
+        "description": "Read the article and extract information relevant to justice in Aristotelian philosophy",
+        "actions": [
+          {
+            "action": "read_page",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Search for 'Justice in Confucian ethics'",
+        "description": "Use the Wikipedia search to find information about justice in Confucian ethics",
+        "actions": [
+          {
+            "action": "type",
+            "parameters": {
+              "selector": "#searchInput",
+              "text": "Justice in Confucian ethics"
+            }
+          },
+          {
+            "action": "press_enter",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Extract information about 'Justice in Confucian ethics'",
+        "description": "Read the article and extract information relevant to justice in Confucian ethics",
+        "actions": [
+          {
+            "action": "read_page",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Search for 'Justice in Islamic jurisprudence'",
+        "description": "Use the Wikipedia search to find information about justice in Islamic jurisprudence",
+        "actions": [
+          {
+            "action": "type",
+            "parameters": {
+              "selector": "#searchInput",
+              "text": "Justice in Islamic jurisprudence"
+            }
+          },
+          {
+            "action": "press_enter",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Extract information about 'Justice in Islamic jurisprudence'",
+        "description": "Read the article and extract information relevant to justice in Islamic jurisprudence",
+        "actions": [
+          {
+            "action": "read_page",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Compare the concepts of justice",
+        "description": "Compare the extracted information about justice in Aristotelian philosophy, Confucian ethics, and Islamic jurisprudence",
+        "actions": [
+          {
+            "action": "done",
+            "parameters": {}
+          }
+        ]
+      }
+    ]
+  },
+  "wikipedia_birth_date:was_marie_curie_born": {
+    "goal": "When was Marie Curie born?",
+    "subgoals": [
+      {
+        "id": 1,
+        "title": "Search for Marie Curie on Wikipedia",
+        "description": "Use the Wikipedia search to find the topic",
+        "actions": [
+          {
+            "action": "type",
+            "parameters": {
+              "selector": "#searchInput",
+              "text": "Marie Curie"
+            }
+          },
+          {
+            "action": "press_enter",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Open the Marie Curie article",
+        "description": "Click the most relevant result",
+        "actions": [
+          {
+            "action": "click",
+            "parameters": {
+              "selector": "li.mw-search-result a"
+            }
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Extract birth date information",
+        "description": "Read the article and extract information relevant to the question",
+        "actions": [
+          {
+            "action": "read_page",
+            "parameters": {}
+          }
+        ]
+      }
+    ]
+  }
+}
