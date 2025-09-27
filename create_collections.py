@@ -133,22 +133,18 @@ actions = [
     }
 ]
 
-# Insert all actions
+# Insert all actions and collect their actual UUIDs
+action_uuids = {}
 for action in actions:
-    Action.data.insert(action, uuid=uuid.uuid5(uuid.NAMESPACE_URL, f"action:{action['name']}:v1").hex)
-    print(f"✅ Inserted action: {action['name']}")
+    result = Action.data.insert(action, uuid=uuid.uuid5(uuid.NAMESPACE_URL, f"action:{action['name']}:v1").hex)
+    action_uuids[action['name']] = result  # Store the actual UUID returned by Weaviate
+    print(f"✅ Inserted action: {action['name']} (UUID: {result})")
 
 print(f"✅ All {len(actions)} Actions inserted successfully!")
 
 # --- Insert Example Tasks ---
 print("\nInserting example Tasks...")
 Task = client.collections.get("Task")
-
-# Get action UUIDs for referencing
-action_uuids = {}
-for action in actions:
-    action_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"action:{action['name']}:v1").hex
-    action_uuids[action['name']] = action_uuid
 
 # Task 1: Search for celebrity birth date
 task_search_actions = [

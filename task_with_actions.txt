@@ -1,0 +1,42 @@
+================================================================================
+TASK WITH CROSS-REFERENCED ACTIONS
+================================================================================
+
+TASK:
+----------------------------------------
+Title: Search for celebrity birth date
+UUID: 12f2a2d3-4cc0-545d-911d-715eae5a0457
+
+ACTION SEQUENCE:
+----------------------------------------
+Total Actions: 6
+
+1. Action: goto
+   UUID: 02c26c3d-c6ec-5708-add4-02507580934c
+   Description: Navigate to a specified URL.
+   Parameters: {"url": "string"}
+
+2. Action: type
+   UUID: d814b233-35d7-5726-8895-892368939bc7
+   Description: Type text into an input field identified by a CSS selector.
+   Parameters: {"selector": "string", "text": "string"}
+
+3. Action: press_enter
+   UUID: 719a0eb5-250e-5f04-b3c9-2fe77796e457
+   Description: Press the Enter key on the currently focused element.
+   Parameters: {}
+
+4. Action: wait
+   UUID: 968a0ad5-c97c-5a35-98df-f8edb03bc2c5
+   Description: Wait for a specified number of seconds.
+   Parameters: {"seconds": "number"}
+
+5. Action: read_page
+   UUID: 81de18cc-6ce7-51f4-a028-b3df4119eee4
+   Description: Read and extract text content from the current page.
+   Parameters: {}
+
+6. Action: done
+   UUID: 6be289a1-1595-53cc-8547-477c4d7a93d0
+   Description: Mark the task as completed and return results.
+   Parameters: {}
