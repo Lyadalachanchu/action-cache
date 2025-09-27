@@ -75,7 +75,14 @@ print("\nCreating Task collection...")
 ensure_drop("Task")
 client.collections.create(
     name="Task",
-    vector_config=wc.Configure.Vectors.self_provided(),
+    vector_config=[
+        Configure.Vectors.text2vec_openai(
+            name="title_vector",
+            source_properties=["title"],
+            model="text-embedding-3-large",
+            dimensions=1024
+        )
+    ],
     properties=[
         wc.Property(name="title", data_type=wc.DataType.TEXT),
     ],
