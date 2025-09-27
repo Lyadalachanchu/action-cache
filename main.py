@@ -91,7 +91,7 @@ class LLMBrowserAgent:
         """
         
         response = await self.openai_client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-5",
             messages=[{"role": "user", "content": synthesis_prompt}],
             temperature=0.1
         )
@@ -157,7 +157,7 @@ class LLMBrowserAgent:
                     "title": "Open relevant Wikipedia article",
                     "description": "Click on the most relevant article from search results",
                     "actions": [
-                        {{"action": "click", "parameters": {{"selector": "a[href*='Crisis']"}}, "description": "Click on Crisis-related article link"}}
+                        {{"action": "click", "parameters": {{"selector": "a"}}, "description": "Click on the most relevant article link from search results"}}
                     ]
                 }},
                 {{
@@ -235,6 +235,7 @@ class LLMBrowserAgent:
                         href: el.href || '',
                         selector: el.id ? `#${el.id}` : 
                                  el.className ? `.${el.className.split(' ')[0]}` :
+                                 (el.tagName.toLowerCase() === 'a' && el.href) ? `a[href="${el.href}"]` :
                                  el.tagName.toLowerCase()
                     }))
                     .slice(0, 20); // Limit to first 20 interactive elements
@@ -289,6 +290,16 @@ class LLMBrowserAgent:
         if len([a for a in recent_actions if "type(#searchInput)" in a]) >= 2:
             repeated_action_warning = "\n🚨 CRITICAL: You've typed multiple times. STOP typing and use press_enter() immediately!"
         
+        # Check for repeated read_page actions on the same page
+        read_page_count = len([a for a in recent_actions if "read_page(" in a])
+        if read_page_count >= 3:
+            repeated_action_warning += "\n🔁 WARNING: You've read this page multiple times. Move to the next subgoal by searching for the next topic!"
+        
+        # Check for repeated press_enter actions (search submission loops)
+        press_enter_count = len([a for a in recent_actions if "press_enter(" in a])
+        if press_enter_count >= 3:
+            repeated_action_warning += "\n🚨 CRITICAL: You've pressed Enter multiple times! Stop submitting searches. Click an article link from interactive_elements or use goto(https://en.wikipedia.org/wiki/TOPIC_NAME)."
+        
         # Get current subgoal context
         current_subgoal = None
         planned_actions = []
@@ -336,15 +347,19 @@ class LLMBrowserAgent:
         WIKIPEDIA-ONLY STRATEGY:
         1. You start on Wikipedia - use the search box to search for the topic (e.g., "Crisis of the Roman Republic")
         2. Press enter to submit the search
-        3. Click on the most relevant article from search results
+        3. **MUST CLICK** on the most relevant article from search results - look for links in interactive_elements
         4. Use read_page() to analyze the content and answer the question
         5. If information is not found, try searching for more specific terms or related topics
         6. NEVER navigate away from Wikipedia - all research must be done within Wikipedia
+        7. **CRITICAL**: After searching, always click on an article link before reading the page
         
         CRITICAL RULES: 
         - NEVER repeat the same action with the same parameters - this causes infinite loops
         - Look at your recent actions and choose the NEXT logical step
         - If you just typed something, the next action MUST be press_enter() or click() - NEVER type again
+        - **AFTER SEARCH RESULTS LOAD**: You MUST click on a relevant article link before reading
+        - **DO NOT read_page() on search results** - only read actual Wikipedia articles
+        - Look for article links in interactive_elements and click them
         - Follow the planned action sequence for the current subgoal
         - After typing in a search box, you MUST use press_enter() to submit - no exceptions
         - If you've already typed a search query, do NOT type again - press Enter instead
@@ -373,23 +388,26 @@ class LLMBrowserAgent:
         except json.JSONDecodeError:
             return {"action": "wait", "parameters": {"seconds": 1}, "reasoning": "Failed to parse LLM response"}
     
-    def check_subgoal_completion(self, action):
+    def check_subgoal_completion(self, action, success=True):
         """Check if current subgoal should be marked as complete"""
         if not self.subgoals or self.current_subgoal_index >= len(self.subgoals):
             return
             
         current_subgoal = self.subgoals[self.current_subgoal_index]
         
-        # Mark subgoal complete when read_page extracts information
+        # NOTE: read_page action handles its own subgoal advancement logic
+        # to prevent double advancement issues
         if action == "read_page":
-            print(f"\n✅ SUBGOAL COMPLETED: {current_subgoal['title']}")
-            self.current_subgoal_index += 1
-            
-            if self.current_subgoal_index < len(self.subgoals):
-                next_subgoal = self.subgoals[self.current_subgoal_index]
-                print(f"➡️ MOVING TO NEXT SUBGOAL: {next_subgoal['title']}")
+            if success:
+                print(f"✅ Read action completed successfully for: {current_subgoal['title']}")
             else:
-                print("🏁 ALL SUBGOALS COMPLETED - PREPARING FINAL ANSWER!")
+                print(f"⏸️ Read action failed for: {current_subgoal['title']} - need to try different approach")
+            return  # Don't advance here, let read_page logic handle it
+        
+        # For other actions, mark subgoal complete when appropriate
+        if success and action in ["click", "type", "press_enter"]:
+            # These actions don't directly complete subgoals, just mark progress
+            print(f"✅ Action {action} completed for subgoal: {current_subgoal['title']}")
     
     async def execute_action(self, action_data, user_goal=""):
         """Execute the action determined by the LLM"""
@@ -413,15 +431,56 @@ class LLMBrowserAgent:
                 params = {}
                 action_data = {"action": "press_enter", "parameters": {}, "reasoning": "Auto-corrected from typing loop"}
         
-        # Check if this action completes the current subgoal
-        self.check_subgoal_completion(action)
+        # Guard against press_enter loops – switch to read_page which can auto-click links
+        if action == "press_enter" and len(self.action_history) >= 5:
+            recent_press = [a for a in self.action_history[-6:] if "press_enter(" in a]
+            if len(recent_press) >= 3:
+                print("🚨 BLOCKED: Multiple press_enter actions detected. Switching to read_page() to progress.")
+                action = "read_page"
+                params = {}
+                action_data = {"action": "read_page", "parameters": {}, "reasoning": "Auto-corrected from press_enter loop"}
+        
+        # We'll check subgoal completion after executing the action
         
         if action == "click":
             selector = params.get("selector")
             try:
+                # Special handling for generic "a" selector - find specific article links
+                if selector == "a":
+                    print("🔍 Generic 'a' selector detected, finding specific article links...")
+                    page_info = await self.get_page_info()
+                    article_links = [elem for elem in page_info.get('interactive_elements', []) 
+                                   if elem.get('tag') == 'a' and elem.get('href') and '/wiki/' in elem.get('href', '')]
+                    
+                    if article_links:
+                        # Use the first relevant article link
+                        best_link = article_links[0]
+                        selector = best_link.get('selector')
+                        print(f"🎯 Found article link: '{best_link.get('text', 'No text')[:50]}' (selector: {selector})")
+                    else:
+                        print("❌ No article links found, trying generic link click")
+                
                 # Wait for element to be visible and clickable
                 await self.page.wait_for_selector(selector, timeout=5000, state='visible')
-                await self.page.click(selector, timeout=5000)
+                
+                # Try JavaScript click first (more reliable for some elements)
+                success = await self.page.evaluate(f"""
+                    () => {{
+                        const element = document.querySelector('{selector}');
+                        if (element && element.offsetParent !== null) {{
+                            element.click();
+                            return true;
+                        }}
+                        return false;
+                    }}
+                """)
+                
+                if not success:
+                    # Fallback to Playwright click
+                    await self.page.click(selector, timeout=5000)
+                
+                print(f"✅ Successfully clicked {selector}")
+                
             except Exception as e:
                 print(f"Failed to click {selector}: {e}")
                 return False
@@ -429,8 +488,75 @@ class LLMBrowserAgent:
             selector = params.get("selector")
             text = params.get("text")
             try:
-                # Wait for element to exist
-                await self.page.wait_for_selector(selector, timeout=5000)
+                # Special handling for search input - try multiple selectors and navigation
+                if selector == "#searchInput" or "search" in selector.lower():
+                    print(f"🔍 Looking for search input on current page...")
+                    
+                    # Try multiple search input selectors
+                    search_selectors = [
+                        "#searchInput", 
+                        "#searchText", 
+                        "input[name='search']", 
+                        "input[type='search']", 
+                        ".cdx-text-input__input",
+                        "input[placeholder*='Search']",
+                        ".mw-searchInput"
+                    ]
+                    
+                    element_found = False
+                    working_selector = None
+                    
+                    for search_selector in search_selectors:
+                        try:
+                            # Check if element exists and is visible
+                            element_exists = await self.page.evaluate(f"""
+                                () => {{
+                                    const el = document.querySelector('{search_selector}');
+                                    return el && el.offsetParent !== null;
+                                }}
+                            """)
+                            
+                            if element_exists:
+                                working_selector = search_selector
+                                element_found = True
+                                print(f"✅ Found search input with selector: {search_selector}")
+                                break
+                                
+                        except Exception:
+                            continue
+                    
+                    if not element_found:
+                        print("❌ Search input not found on current page")
+                        print("🔄 Navigating to Wikipedia homepage...")
+                        
+                        # Navigate to Wikipedia homepage
+                        await self.page.goto("https://en.wikipedia.org", wait_until='networkidle', timeout=15000)
+                        await asyncio.sleep(2)
+                        
+                        # Try to find search input on homepage
+                        for search_selector in search_selectors:
+                            try:
+                                element_exists = await self.page.evaluate(f"""
+                                    () => {{
+                                        const el = document.querySelector('{search_selector}');
+                                        return el && el.offsetParent !== null;
+                                    }}
+                                """)
+                                
+                                if element_exists:
+                                    working_selector = search_selector
+                                    element_found = True
+                                    print(f"✅ Found search input on homepage: {search_selector}")
+                                    break
+                                    
+                            except Exception:
+                                continue
+                    
+                    if not element_found:
+                        print("❌ Could not find search input anywhere")
+                        return False
+                    
+                    selector = working_selector
                 
                 # Use pure JavaScript approach - most compatible
                 escaped_text = text.replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
@@ -506,6 +632,43 @@ class LLMBrowserAgent:
                         await self.page.wait_for_load_state('networkidle', timeout=5000)
                     except:
                         await asyncio.sleep(2)
+                
+                # After a successful submit, if still on a search page, auto-click a relevant article
+                try:
+                    page_title = await self.page.title()
+                    page_url = self.page.url
+                    if "search" in page_title.lower() or "search" in page_url.lower():
+                        print("🔎 Post-submit: still on search page. Attempting to click a relevant article link...")
+                        page_info = await self.get_page_info()
+                        links = [el for el in page_info.get('interactive_elements', []) if el.get('tag') == 'a' and '/wiki/' in el.get('href', '')]
+                        links = [l for l in links if not any(x in l.get('href','') for x in ['/wiki/Wikipedia:', '/wiki/Help:', '/wiki/Special:', '/wiki/Portal:', '/wiki/Main_Page'])]
+                        # Prefer a link that contains the current target topic if we can infer it
+                        target = None
+                        try:
+                            current_subgoal = self.subgoals[self.current_subgoal_index] if self.current_subgoal_index < len(self.subgoals) else None
+                            topic_hint = None
+                            if current_subgoal and current_subgoal.get('title'):
+                                # Heuristic: extract proper name from subgoal title, e.g., "Search for X on Wikipedia"
+                                words = current_subgoal['title'].replace('Search for', '').replace('Extract', '').replace(' on Wikipedia','').strip()
+                                topic_hint = words if words else None
+                            if topic_hint:
+                                lowered = topic_hint.lower().replace(' ', '_')
+                                preferred = [l for l in links if lowered in l.get('href','').lower()]
+                                if preferred:
+                                    target = preferred[0]
+                        except Exception:
+                            pass
+                        if not target:
+                            target = links[0] if links else None
+                        if target:
+                            try:
+                                await self.page.click(target.get('selector'), timeout=5000)
+                                await self.page.wait_for_load_state('networkidle', timeout=10000)
+                                print("✅ Navigated to article from search results")
+                            except Exception as e:
+                                print(f"❌ Auto-click from search failed: {e}")
+                except Exception as e:
+                    print(f"Post-submit search handling error: {e}")
                     
             except Exception as e:
                 # The "Execution context destroyed" error is actually expected during navigation
@@ -522,6 +685,64 @@ class LLMBrowserAgent:
                     return False
         elif action == "read_page":
             try:
+                # Check if we're on a search results page
+                page_title = await self.page.title()
+                page_url = self.page.url
+                
+                if "search" in page_title.lower() or "search" in page_url.lower():
+                    print("🚫 BLOCKED: Cannot read search results page - you must click an article first!")
+                    print("🔍 Automatically looking for relevant article links to click...")
+                    
+                    # Look for article links in the current interactive elements
+                    interactive_elements = (await self.get_page_info()).get('interactive_elements', [])
+                    article_links = [elem for elem in interactive_elements if elem.get('tag') == 'a' and elem.get('href') and '/wiki/' in elem.get('href', '')]
+                    
+                    # Filter for relevant article links (not navigation links)
+                    relevant_links = [link for link in article_links if link.get('href') and 
+                                    not any(nav in link.get('href', '') for nav in ['/wiki/Main_Page', '/wiki/Wikipedia:', '/wiki/Portal:', '/wiki/Special:', '/wiki/Help:', '/wiki/Category:', '/wiki/Template:', '/wiki/File:'])]
+                    
+                    
+                    if relevant_links:
+                        print(f"📋 Found {len(relevant_links)} relevant article links:")
+                        for i, link in enumerate(relevant_links[:5], 1):
+                            print(f"   {i}. {link.get('text', 'No text')[:50]} (selector: {link.get('selector')})")
+                        
+                        # Auto-click the most relevant link
+                        best_link = relevant_links[0]
+                        print(f"🎯 Auto-clicking most relevant link: {best_link.get('text', 'No text')[:50]}")
+                        
+                        try:
+                            await self.page.click(best_link.get('selector'), timeout=5000)
+                            print(f"✅ Successfully auto-clicked and navigated to article")
+                            # Wait for navigation
+                            await self.page.wait_for_load_state('networkidle', timeout=10000)
+                            
+                            # Now try reading the actual article page
+                            return await self.execute_action({"action": "read_page", "parameters": {}}, user_goal)
+                            
+                        except Exception as e:
+                            print(f"❌ Auto-click failed: {e}")
+                            return False
+                    else:
+                        print("❌ No relevant article links found on search results page")
+                        print("🔄 Falling back to direct navigation using inferred topic, if available")
+                        try:
+                            # Infer topic from current subgoal title
+                            current_subgoal = self.subgoals[self.current_subgoal_index] if self.current_subgoal_index < len(self.subgoals) else None
+                            topic_hint = None
+                            if current_subgoal and current_subgoal.get('title'):
+                                words = current_subgoal['title'].replace('Search for', '').replace("Extract", '').replace(' on Wikipedia','').strip()
+                                topic_hint = words if words else None
+                            if not topic_hint:
+                                raise Exception('No topic hint found for direct navigation')
+                            topic_path = topic_hint.replace(' ', '_')
+                            await self.page.goto(f"https://en.wikipedia.org/wiki/{topic_path}", wait_until='networkidle', timeout=15000)
+                            print("✅ Direct navigation to Matt Damon page successful")
+                            return await self.execute_action({"action": "read_page", "parameters": {}}, user_goal)
+                        except Exception as e:
+                            print(f"❌ Direct navigation failed: {e}")
+                            return False
+                
                 # Get page text content for analysis
                 page_text = await self.page.evaluate("""
                     () => {
@@ -561,26 +782,45 @@ class LLMBrowserAgent:
                 
                 extracted_info = response.choices[0].message.content
                 
-                # Store the information for this subgoal
-                subgoal_info = {
-                    "subgoal_id": current_subgoal['id'] if current_subgoal else len(self.collected_information) + 1,
-                    "subgoal_title": current_subgoal['title'] if current_subgoal else "Information extraction",
-                    "information": extracted_info,
-                    "page_title": await self.page.title(),
-                    "page_url": self.page.url
-                }
+                # Check if we already have information for this subgoal
+                current_subgoal_id = current_subgoal['id'] if current_subgoal else len(self.collected_information) + 1
+                existing_info = [info for info in self.collected_information if info['subgoal_id'] == current_subgoal_id]
                 
-                self.collected_information.append(subgoal_info)
-                
-                print(f"\n📚 INFORMATION COLLECTED for subgoal: {subgoal_info['subgoal_title']}")
-                print(f"📝 Info: {extracted_info[:100]}...")
-                
-                # Check if all subgoals are completed
-                if self.current_subgoal_index >= len(self.subgoals) - 1:
-                    await self.provide_final_answer(user_goal)
-                    return True
-                
-                return False  # Continue to next subgoal
+                if existing_info:
+                    print(f"📚 Information already collected for subgoal: {current_subgoal['title']}")
+                    print(f"🔄 Moving to next subgoal...")
+                    # Force progression to next subgoal
+                    self.current_subgoal_index += 1
+                    
+                    if self.current_subgoal_index < len(self.subgoals):
+                        next_subgoal = self.subgoals[self.current_subgoal_index]
+                        print(f"➡️ MOVING TO NEXT SUBGOAL: {next_subgoal['title']}")
+                        return False  # Continue automation
+                    else:
+                        print("🏁 ALL SUBGOALS COMPLETED - PREPARING FINAL ANSWER!")
+                        await self.provide_final_answer(user_goal)
+                        return True
+                else:
+                    # Store the information for this subgoal
+                    subgoal_info = {
+                        "subgoal_id": current_subgoal_id,
+                        "subgoal_title": current_subgoal['title'] if current_subgoal else "Information extraction",
+                        "information": extracted_info,
+                        "page_title": await self.page.title(),
+                        "page_url": self.page.url
+                    }
+                    
+                    self.collected_information.append(subgoal_info)
+                    
+                    print(f"\n📚 INFORMATION COLLECTED for subgoal: {subgoal_info['subgoal_title']}")
+                    print(f"📝 Info: {extracted_info[:100]}...")
+                    
+                    # Check if all subgoals are completed
+                    if self.current_subgoal_index >= len(self.subgoals) - 1:
+                        await self.provide_final_answer(user_goal)
+                        return True
+                    
+                    return False  # Continue to next subgoal
                 
             except Exception as e:
                 print(f"Failed to read page: {e}")
@@ -619,11 +859,30 @@ class LLMBrowserAgent:
         elif action == "wait":
             await asyncio.sleep(params.get("seconds", 1))
         elif action == "done":
+            # Check if we actually have collected information before marking as done
+            if len(self.collected_information) < len(self.subgoals) - 1:
+                print("⚠️ WARNING: Not all subgoals have collected information yet!")
+                print("🔄 Continuing automation to gather more information...")
+                return False
             return True
+        
+        # Check subgoal completion for successful actions
+        action_success = True  # Assume success if we reached this point
+        if action == "read_page":
+            # Check if information was actually collected for the current subgoal
+            current_subgoal_id = self.current_subgoal_index + 1
+            action_success = any(info['subgoal_id'] == current_subgoal_id for info in self.collected_information)
+            
+            if action_success:
+                print(f"✅ Information successfully collected for subgoal {current_subgoal_id}")
+            else:
+                print(f"❌ No information collected for subgoal {current_subgoal_id}")
+        
+        self.check_subgoal_completion(action, action_success)
         
         return False
     
-    async def run_automation(self, user_goal, max_steps=10):
+    async def run_automation(self, user_goal, max_steps=30):
         """Run the LLM-driven browser automation"""
         print(f"\n🚀 STARTING AUTOMATION")
         print(f"Goal: {user_goal}")
@@ -731,7 +990,10 @@ async def main():
             if openai_key:
                 # user_goal = "When did the Crisis of the Roman Republic start?"
                 # user_goal = "When did the Crisis of the Roman Republic end?"
-                user_goal = "Explain how the concept of 'justice' differs between Aristotelian philosophy, Confucian ethics, and Islamic jurisprudence, with specific examples."
+                # user_goal = "Explain how the concept of 'justice' differs between Aristotelian philosophy, Confucian ethics, and Islamic jurisprudence, with specific examples."
+                # user_goal = "Explain how the concept of 'justice' differs between Aristotelian philosophy and Confucian ethics with specific examples."
+                user_goal = "Is Chris Martin younger than Matt Damon?"
+
                 await agent.run_automation(user_goal)
             else:
                 print("Skipping LLM automation - add OPENAI_API_KEY to .env file")
