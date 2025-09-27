@@ -1,0 +1,20 @@
+{
+  "When was Marie Curie born?": {
+    "answer": "\"Marie Curie was born on November 7, 1867\"",
+    "meta": {
+      "policy": "always",
+      "url": "https://en.wikipedia.org/wiki/Marie_Curie",
+      "title": "Marie Curie - Wikipedia"
+    },
+    "ts": 1758989447.449483
+  },
+  "When was Einstein born?": {
+    "answer": "\"Einstein was born on March 14, 1879\"",
+    "meta": {
+      "policy": "always",
+      "url": "https://en.wikipedia.org/wiki/Albert_Einstein",
+      "title": "Albert Einstein - Wikipedia"
+    },
+    "ts": 1758989564.202603
+  }
+}

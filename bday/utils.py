@@ -1,12 +1,15 @@
 """
 utils.py
 --------
-Small utilities: pricing, token accounting, and intent parsing.
+Pricing, token accounting, intent helpers, and LLM memoization cache.
 """
 
 import os
 import re
+import hashlib
+import json
 from typing import Optional
+
 
 # --- OpenAI pricing (USD per 1K tokens). Override with env OPENAI_PRICE_INPUT/OUTPUT ---
 PRICES_PER_1K = {
@@ -84,3 +87,38 @@ def extract_person_name(user_goal: str) -> str:
         if m:
             return m.group(1).strip()
     return user_goal.strip()
+
+
+# --- LLM memoization (prompt → completion) ---
+
+class LLMCache:
+    """
+    Simple on-disk memo cache for LLM calls.
+    Key = (model, sha256(prompt))
+    Value = {text, usage?}
+    """
+    def __init__(self, path: str = None):
+        self.path = path or os.getenv("LLM_CACHE_FILE", "llm_cache.json")
+        self.kv = {}
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.kv = json.load(f)
+                print(f"[info] Loaded LLM cache: {len(self.kv)} entries from {self.path}.")
+            except Exception as e:
+                print(f"[warn] Failed to load LLM cache: {e}")
+
+    def _key(self, model: str, prompt: str):
+        h = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        return f"{model}:{h}"
+
+    def get(self, model: str, prompt: str):
+        return self.kv.get(self._key(model, prompt))
+
+    def put(self, model: str, prompt: str, text: str, usage: Optional[dict]):
+        self.kv[self._key(model, prompt)] = {"text": text, "usage": usage}
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.kv, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[warn] Failed to save LLM cache: {e}")

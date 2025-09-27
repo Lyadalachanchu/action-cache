@@ -1,0 +1,100 @@
+{
+  "gpt-4:081d6476f06ea123ef5c5346615056b9e58852595a86e19c6b195836a1d0e628": {
+    "text": "{\n  \"action\": \"type\",\n  \"parameters\": { \"selector\": \"#searchInput\", \"text\": \"Marie Curie\" },\n  \"reasoning\": \"The first step to find information about Marie Curie on Wikipedia is to type her name into the search box.\"\n}",
+    "usage": {
+      "prompt_tokens": 845,
+      "completion_tokens": 59
+    }
+  },
+  "gpt-4:7eb9d66b2b0002b3da0c13b9a9d411b31c1c7fc5e761aac89b37a0086ecaaadc": {
+    "text": "{\n  \"action\": \"press_enter\",\n  \"parameters\": {},\n  \"reasoning\": \"After typing 'Marie Curie' into the search box, we need to submit the search to find the Wikipedia page about her.\"\n}",
+    "usage": {
+      "prompt_tokens": 860,
+      "completion_tokens": 48
+    }
+  },
+  "gpt-4:9e111e7f45d8ed16413998eab039290c58a885c70208a3cd595ce3018a0888e3": {
+    "text": "{\n  \"action\": \"read_page\",\n  \"parameters\": {},\n  \"reasoning\": \"We need to read the page to find the information about Marie Curie's birth date.\"\n}",
+    "usage": {
+      "prompt_tokens": 883,
+      "completion_tokens": 39
+    }
+  },
+  "gpt-4:b16faec7ff85fd5fb3f2aa2e7f6458ac18d9073f5bdca8c231f1ea6607fee822": {
+    "text": "\"Marie Curie was born on November 7, 1867\"",
+    "usage": {
+      "prompt_tokens": 403,
+      "completion_tokens": 16
+    }
+  },
+  "gpt-4:3049412529286eed71597597baf111e8256a3af6a753d2e7b865573a7f975c0b": {
+    "text": "{\n  \"action\": \"read_page\",\n  \"parameters\": {},\n  \"reasoning\": \"We need to read the page to find the information about Marie Curie's birth date.\"\n}",
+    "usage": {
+      "prompt_tokens": 886,
+      "completion_tokens": 39
+    }
+  },
+  "gpt-4:9367207e7534412016f1a8d8a8ecf3b66d118aba87864f857508cafe66afd504": {
+    "text": "Marie Curie was born on November 7, 1867, as stated in her Wikipedia article (source: Marie Curie - Wikipedia).",
+    "usage": {
+      "prompt_tokens": 172,
+      "completion_tokens": 30
+    }
+  },
+  "gpt-4:9fad41fde73545dd4cc7dc7b6854827b784490ff71f48f073590e4a11927a064": {
+    "text": "{\n    \"subgoals\": [\n        {\n            \"id\": 1,\n            \"title\": \"Search for Einstein on Wikipedia\",\n            \"description\": \"Use the Wikipedia search to find the Einstein's page\",\n            \"actions\": [\n                {\"action\": \"type\", \"parameters\": {\"selector\": \"#searchInput\", \"text\": \"Albert Einstein\"}},\n                {\"action\": \"press_enter\", \"parameters\": {}}\n            ]\n        },\n        {\n            \"id\": 2,\n            \"title\": \"Open Einstein's Wikipedia page\",\n            \"description\": \"Click the first result to open Einstein's Wikipedia page\",\n            \"actions\": [\n                {\"action\": \"click\", \"parameters\": {\"selector\": \"li.mw-search-result a\"}}\n            ]\n        },\n        {\n            \"id\": 3,\n            \"title\": \"Extract Einstein's birth date\",\n            \"description\": \"Read the article and extract the information about Einstein's birth date\",\n            \"actions\": [\n                {\"action\": \"read_page\", \"parameters\": {}}\n            ]\n        }\n    ]\n}",
+    "usage": {
+      "prompt_tokens": 441,
+      "completion_tokens": 218
+    }
+  },
+  "gpt-4:b4268c81a060dd8e4883039accd776be2c5ea5a6c33aa94d6772f9dd0bf44bda": {
+    "text": "{\n  \"action\": \"type\",\n  \"parameters\": { \"selector\": \"#searchInput\", \"text\": \"Albert Einstein\" },\n  \"reasoning\": \"The first step to find Einstein's page is to type 'Albert Einstein' into the search box.\"\n}",
+    "usage": {
+      "prompt_tokens": 841,
+      "completion_tokens": 55
+    }
+  },
+  "gpt-4:a9b0f2e83402d93987eb2935035805ea75e91c1636b8a29a857a41d6600861a3": {
+    "text": "{\n  \"action\": \"press_enter\",\n  \"parameters\": {},\n  \"reasoning\": \"After typing 'Albert Einstein' into the search box, we need to submit the search query to find the page about Einstein.\"\n}",
+    "usage": {
+      "prompt_tokens": 858,
+      "completion_tokens": 46
+    }
+  },
+  "gpt-4:6fb2ccf8a02f295ab5840a39f108b24267d02c114cfd6e0e6723ed7fe95bfce4": {
+    "text": "{\n  \"action\": \"read_page\",\n  \"parameters\": {},\n  \"reasoning\": \"Since we are already on Albert Einstein's Wikipedia page, the next step is to read the page to find the information about his birth date.\"\n}",
+    "usage": {
+      "prompt_tokens": 875,
+      "completion_tokens": 49
+    }
+  },
+  "gpt-4:e16a2c6f72749af4fc64778c836197549feb6de90ed76c678ac6662d8b26c17e": {
+    "text": "{\n  \"action\": \"read_page\",\n  \"parameters\": {},\n  \"reasoning\": \"Since we are already on Albert Einstein's Wikipedia page, we can read the page to find the information about his birth date.\"\n}",
+    "usage": {
+      "prompt_tokens": 893,
+      "completion_tokens": 46
+    }
+  },
+  "gpt-4:4579b1db9db31ea1e5a294adc00c76670ed7f9acd930d30bb9fb8b95fd06e7f4": {
+    "text": "Albert Einstein was born on March 14, 1879, as confirmed by his Wikipedia page (Albert Einstein - Wikipedia).",
+    "usage": {
+      "prompt_tokens": 158,
+      "completion_tokens": 25
+    }
+  },
+  "gpt-4:b40f604d8ac1c6c95e417a3731150f69aa015377f079d1cafc684d6710db6947": {
+    "text": "\"Einstein was born on March 14, 1879\"",
+    "usage": {
+      "prompt_tokens": 368,
+      "completion_tokens": 13
+    }
+  },
+  "gpt-4:338afe24a831c45603a40e611ce8dada086749680f06141c374698f1c4517e48": {
+    "text": "Albert Einstein was born on March 14, 1879, as stated on his Wikipedia page (Albert Einstein - Wikipedia).",
+    "usage": {
+      "prompt_tokens": 162,
+      "completion_tokens": 25
+    }
+  }
+}

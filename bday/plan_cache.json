@@ -195,5 +195,52 @@
         ]
       }
     ]
+  },
+  "wikipedia_birth_date:was_einstein_born": {
+    "goal": "When was Einstein born?",
+    "subgoals": [
+      {
+        "id": 1,
+        "title": "Search for Einstein on Wikipedia",
+        "description": "Use the Wikipedia search to find the Einstein's page",
+        "actions": [
+          {
+            "action": "type",
+            "parameters": {
+              "selector": "#searchInput",
+              "text": "Albert Einstein"
+            }
+          },
+          {
+            "action": "press_enter",
+            "parameters": {}
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Open Einstein's Wikipedia page",
+        "description": "Click the first result to open Einstein's Wikipedia page",
+        "actions": [
+          {
+            "action": "click",
+            "parameters": {
+              "selector": "li.mw-search-result a"
+            }
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Extract Einstein's birth date",
+        "description": "Read the article and extract the information about Einstein's birth date",
+        "actions": [
+          {
+            "action": "read_page",
+            "parameters": {}
+          }
+        ]
+      }
+    ]
   }
 }

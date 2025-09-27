@@ -6,6 +6,8 @@ LLM-driven planner agent (Wikipedia-only) with:
 - TokenCost metrics (tokens & $)
 - LLM policy: always / verify / fallback
 - Optional DOM-first extraction for 'wikipedia_birth_date'
+- LLM memoization (prompt cache) to avoid re-paying for identical prompts
+- Answer cache for stable facts (birthdates)
 """
 
 import asyncio
@@ -16,18 +18,27 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from playwright.async_api import async_playwright
 
 from plan_store import PlanStore
-from utils import TokenCost, classify_intent, topic_key_from_goal, extract_person_name
-from dom_extractors import extract_birthdate_dom, format_birthdate, looks_like_date
+from answer_cache import AnswerCache
+from utils import TokenCost, classify_intent, topic_key_from_goal, extract_person_name, LLMCache
+from dom_extractors import extract_birthdate_dom, format_birthdate
 
 load_dotenv()
 
+# ---- Budgets / caps to keep costs predictable ----
+INTERACTIVE_LIMIT = 10          # show at most 10 elements to the LLM
+PAGE_BUDGET_BIRTH = 1200        # chars for birth-date extraction/verify
+PAGE_BUDGET_RESEARCH = 1800     # chars for general research extraction
+MAX_TOK_PLANNING = 300
+MAX_TOK_ACTION   = 150
+MAX_TOK_EXTRACT  = 120
+MAX_TOK_SYNTH    = 400
 
+# ---- Policy ----
 class LLMPolicy(str, Enum):
-    ALWAYS = "always"    # always use LLM to extract
-    VERIFY = "verify"    # DOM first, then small LLM to verify/format
+    ALWAYS = "always"      # always use LLM to extract
+    VERIFY = "verify"      # DOM first, then small LLM to verify/format
     FALLBACK = "fallback"  # DOM first, LLM only if DOM fails
 
 
@@ -42,12 +53,34 @@ class LLMBrowserAgent:
         self.current_subgoal_index = 0
         self.collected_information: List[Dict[str, Any]] = []
 
-        # New: caching and tokens
+        # Caches/metrics
         self.plan_store = PlanStore()
+        self.answer_cache = AnswerCache()
+        self.llm_cache = LLMCache()
         self.tokens = TokenCost(self.model)
         self.policy = LLMPolicy(llm_policy)
 
         print(f"LLM Browser Agent ready (model={self.model}, policy={self.policy.value})")
+
+    # ---------- tiny wrapper with memoization + token accounting ----------
+    async def _chat(self, prompt: str, *, max_tokens: int, temperature: float = 0.1) -> str:
+        cached = self.llm_cache.get(self.model, prompt)
+        if cached:
+            # cached completions count as zero tokens/cost
+            return cached["text"]
+        resp = await self.openai.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = resp.choices[0].message.content
+        self.tokens.add_usage(getattr(resp, "usage", None))
+        usage = None
+        if getattr(resp, "usage", None):
+            usage = dict(prompt_tokens=resp.usage.prompt_tokens, completion_tokens=resp.usage.completion_tokens)
+        self.llm_cache.put(self.model, prompt, text, usage)
+        return text
 
     # ---------- Browser helpers ----------
 
@@ -92,6 +125,7 @@ class LLMBrowserAgent:
                     .slice(0, 20);
             }
         """)
+        interactive_elements = interactive_elements[:INTERACTIVE_LIMIT]
         return {
             "title": title,
             "url": url,
@@ -99,7 +133,7 @@ class LLMBrowserAgent:
             "interactive_elements": interactive_elements
         }
 
-    # ---------- Planning phase (with PlanStore cache) ----------
+    # ---------- Planning (with PlanStore cache) ----------
 
     async def create_subgoals_and_actions(self, user_goal: str) -> bool:
         print("\n📋 PLANNING PHASE: Creating subgoals and action plan...")
@@ -169,18 +203,11 @@ class LLMBrowserAgent:
         Make the plan specific to answering: {user_goal}
         """
 
-        resp = await self.openai.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": planning_prompt}],
-            temperature=0.1
-        )
-        self.tokens.add_usage(getattr(resp, "usage", None))
-
+        text = await self._chat(planning_prompt, max_tokens=MAX_TOK_PLANNING, temperature=0.1)
         try:
-            plan = json.loads(resp.choices[0].message.content)
+            plan = json.loads(text)
             self.subgoals = plan.get("subgoals", [])
             print(f"📝 Created {len(self.subgoals)} subgoals.")
-            # persist
             self.plan_store.put(intent, topic_key, {"goal": user_goal, "subgoals": self.subgoals})
             return True
         except json.JSONDecodeError as e:
@@ -244,15 +271,9 @@ class LLMBrowserAgent:
         }}
         """
 
-        resp = await self.openai.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        self.tokens.add_usage(getattr(resp, "usage", None))
-
+        text = await self._chat(prompt, max_tokens=MAX_TOK_ACTION, temperature=0.1)
         try:
-            return json.loads(resp.choices[0].message.content)
+            return json.loads(text)
         except json.JSONDecodeError:
             return {"action": "wait", "parameters": {"seconds": 1}, "reasoning": "parse error"}
 
@@ -276,16 +297,10 @@ class LLMBrowserAgent:
     async def llm_extract_birthdate(self, page_text: str, person_name: str):
         prompt = (
             f"Extract the birth date of {person_name}.\n\n"
-            f"Page:\n{page_text[:3000]}\n\n"
+            f"Page:\n{page_text}\n\n"
             f'Respond exactly as:\n"{person_name} was born on [Month Day, Year]"'
         )
-        resp = await self.openai.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
-        )
-        self.tokens.add_usage(getattr(resp, "usage", None))
-        return resp.choices[0].message.content
+        return await self._chat(prompt, max_tokens=MAX_TOK_EXTRACT, temperature=0.0)
 
     async def llm_verify_birthdate(self, page_text: str, person_name: str, dom_raw_date: str):
         formatted = format_birthdate(dom_raw_date) or dom_raw_date
@@ -294,15 +309,9 @@ class LLMBrowserAgent:
             f"Check against the page snippet below. If correct, respond exactly:\n"
             f"\"{person_name} was born on {formatted}\"\n"
             f"If not, respond exactly with the corrected date in that format.\n\n"
-            f"Page snippet:\n{page_text[:1500]}"
+            f"Page snippet:\n{page_text}"
         )
-        resp = await self.openai.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
-        )
-        self.tokens.add_usage(getattr(resp, "usage", None))
-        return resp.choices[0].message.content
+        return await self._chat(prompt, max_tokens=MAX_TOK_EXTRACT, temperature=0.0)
 
     # ---------- Execute one action ----------
 
@@ -374,8 +383,14 @@ class LLMBrowserAgent:
                 except Exception:
                     await asyncio.sleep(2)
             except Exception as e:
-                print(f"Failed to press Enter: {e}")
-                return False
+                if "Execution context was destroyed" in str(e):
+                    try:
+                        await self.page.wait_for_load_state('networkidle', timeout=10000)
+                    except Exception:
+                        await asyncio.sleep(2)
+                else:
+                    print(f"Failed to press Enter: {e}")
+                    return False
 
         elif action == "goto":
             url = params.get("url")
@@ -399,7 +414,7 @@ class LLMBrowserAgent:
             await asyncio.sleep(params.get("seconds", 1))
 
         elif action == "read_page":
-            # Policy-aware extraction for special intents
+            # Intent & page text with budget applied
             intent = classify_intent(user_goal)
             page_text = await self.page.evaluate("""
                 () => {
@@ -409,48 +424,58 @@ class LLMBrowserAgent:
                     return content ? content.innerText : document.body.innerText;
                 }
             """)
+            budget = PAGE_BUDGET_BIRTH if intent == "wikipedia_birth_date" else PAGE_BUDGET_RESEARCH
+            page_text = page_text[:budget]
 
             answer_text: Optional[str] = None
 
             if intent == "wikipedia_birth_date":
-                person = extract_person_name(user_goal)
-                if self.policy == LLMPolicy.ALWAYS:
-                    answer_text = await self.llm_extract_birthdate(page_text, person)
-                elif self.policy == LLMPolicy.VERIFY:
-                    dom_raw = await extract_birthdate_dom(self.page)
-                    if dom_raw:
-                        answer_text = await self.llm_verify_birthdate(page_text, person, dom_raw)
-                    else:
+                # Answer cache short-circuit (stable fact)
+                cached_ans = self.answer_cache.get(user_goal)
+                if cached_ans and self.policy != LLMPolicy.ALWAYS:
+                    print("⚡ Answer cache hit (birth date).")
+                    answer_text = cached_ans["answer"]
+                else:
+                    person = extract_person_name(user_goal)
+                    if self.policy == LLMPolicy.ALWAYS:
                         answer_text = await self.llm_extract_birthdate(page_text, person)
-                else:  # FALLBACK
-                    dom_raw = await extract_birthdate_dom(self.page)
-                    if dom_raw:
-                        answer_text = f"{person} was born on {format_birthdate(dom_raw)}"
-                    else:
-                        answer_text = await self.llm_extract_birthdate(page_text, person)
+                    elif self.policy == LLMPolicy.VERIFY:
+                        dom_raw = await extract_birthdate_dom(self.page)
+                        if dom_raw:
+                            answer_text = await self.llm_verify_birthdate(page_text, person, dom_raw)
+                        else:
+                            answer_text = await self.llm_extract_birthdate(page_text, person)
+                    else:  # FALLBACK
+                        dom_raw = await extract_birthdate_dom(self.page)
+                        if dom_raw:
+                            answer_text = f"{person} was born on {format_birthdate(dom_raw)}"
+                        else:
+                            answer_text = await self.llm_extract_birthdate(page_text, person)
+
+                    # Save to answer cache if it looks good
+                    if answer_text and any(s in answer_text.lower() for s in [" was born on "]):
+                        self.answer_cache.put(user_goal, answer_text, {
+                            "policy": self.policy.value,
+                            "url": self.page.url,
+                            "title": await self.page.title()
+                        })
+
             else:
-                # General research extraction with LLM (keeps demo "LLM agent" feel)
+                # General research extraction with LLM
                 current_subgoal = None
                 if self.current_subgoal_index < len(self.subgoals):
                     current_subgoal = self.subgoals[self.current_subgoal_index]
-
                 extraction_prompt = f"""
                 Extract information relevant to this subgoal: {current_subgoal['title'] if current_subgoal else 'Information extraction'}
                 Description: {current_subgoal['description'] if current_subgoal else 'Extract relevant information'}
                 Overall goal: {user_goal}
 
                 Page:
-                {page_text[:6000]}
+                {page_text}
 
                 Extract only what is relevant. If not found, say "Information not found on this page."
                 """
-                resp = await self.openai.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": extraction_prompt}],
-                    temperature=0.1
-                )
-                self.tokens.add_usage(getattr(resp, "usage", None))
-                answer_text = resp.choices[0].message.content
+                answer_text = await self._chat(extraction_prompt, max_tokens=MAX_TOK_EXTRACT, temperature=0.1)
 
             # record snippet
             info = {
@@ -502,14 +527,9 @@ class LLMBrowserAgent:
         4) clearly states missing info if anything is missing.
         """
 
-        resp = await self.openai.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": synthesis_prompt}],
-            temperature=0.1
-        )
-        self.tokens.add_usage(getattr(resp, "usage", None))
+        text = await self._chat(synthesis_prompt, max_tokens=MAX_TOK_SYNTH, temperature=0.1)
+        final_answer = text
 
-        final_answer = resp.choices[0].message.content
         print("\n🎯 COMPREHENSIVE FINAL ANSWER")
         print("=" * 80)
         print(final_answer)

@@ -23,6 +23,10 @@ def format_birthdate(raw: Optional[str]) -> Optional[str]:
             pass
     return raw
 
+def looks_like_date(text: str) -> bool:
+    return bool(re.search(r"(\d{4}-\d{2}-\d{2})|([A-Za-z]+\s+\d{1,2},\s+\d{4})", text))
+
+
 # -- Wikipedia birth date extraction (DOM/JSON-LD/heuristic) --
 
 async def extract_birthdate_dom(page) -> Optional[str]:
@@ -61,6 +65,3 @@ async def extract_birthdate_dom(page) -> Optional[str]:
           return null;
         }
     """)
-
-def looks_like_date(text: str) -> bool:
-    return bool(re.search(r"(\d{4}-\d{2}-\d{2})|([A-Za-z]+\s+\d{1,2},\s+\d{4})", text))
