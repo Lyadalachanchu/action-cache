@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-# t_agent.py — Strict Wikipedia-only browsing + closed-book extraction
+# t_agent.py — Main automation script with caching and LLM integration
 import argparse
 import asyncio
 import os
 import json
 import re
+import time
 from typing import List, Dict, Any, Optional
-from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 # --- DB + cache
 from cachedb.db import init_db, get_connection
-from cachedb.migrate_from_json import canonicalize
 from cachedb.repos import AnswersRepo, PlansRepo, LLMRepo
 from cachedb_integrations.cache_adapters import (
     AnswerCacheAdapter as AnswerCache,
@@ -25,18 +24,10 @@ from cachedb.config import DB_PATH
 # --- Provider-agnostic LLM client
 from llm_client import LLMClient
 
-# ===================== Globals =====================
-STRICT_WIKI_ONLY = True  # hard guard: only act on *.wikipedia.org and only extract from page text
-MAX_PAGE_TEXT_CHARS = 18000
-WIKI_HOME = "https://en.wikipedia.org"
-WIKI_SEARCH = WIKI_HOME + "/w/index.php?search="
+# --- Import our core agent
+from agent_core import LLMBrowserAgent, MAX_PAGE_TEXT_CHARS
 
-# Common misnamings → correct canonical titles
-WIKI_TITLE_FIXES = {
-    "Crisis_of_the_Roman_Empire": "Crisis_of_the_Third_Century",
-    "Crisis_of_Roman_Empire": "Crisis_of_the_Third_Century",
-}
-
+# ===================== Setup =====================
 load_dotenv()
 init_db()
 
@@ -53,11 +44,109 @@ if llm_client.provider.lower() != "openai":
     print(f"⚠️ LLM provider is '{llm_client.provider}'. To force OpenAI, set:")
     print("   export OPENAI_API_KEY=sk-... ; export OPENAI_MODEL=gpt-4o-mini ; export FORCE_PROVIDER=openai")
 
+# Global tracking
 RUN_TOKENS = {"prompt": 0, "completion": 0, "total": 0}
+EXECUTION_START_TIME = 0
+TOTAL_EXECUTION_TIME = 0
+
+
+def improved_canonicalize(question: str) -> str:
+    """Better canonicalization that properly categorizes different question types"""
+    q = question.lower()
+
+    # Current time/date questions
+    if any(word in q for word in ["current", "today", "now", "what year", "what time", "what date"]):
+        if "year" in q:
+            return "QUERY:current_year"
+        elif "time" in q:
+            return "QUERY:current_time"
+        elif "date" in q:
+            return "QUERY:current_date"
+        else:
+            return "QUERY:current_temporal"
+
+    # Birth date questions
+    if ("when was" in q or "when did" in q) and ("born" in q or "birth" in q):
+        # Extract entity name
+        entity = "UNKNOWN"
+        if "when was" in q and "born" in q:
+            start = q.find("when was") + len("when was")
+            end = q.find("born")
+            if start < end:
+                entity = question[start:end].strip().strip("?").strip()
+
+        if entity != "UNKNOWN":
+            return f"ENTITY:{entity}|ATTR:birth_date"
+        else:
+            return "QUERY:birth_date_unknown_person"
+
+    # Death date questions
+    if ("when did" in q or "when was") and ("die" in q or "death" in q):
+        entity = "UNKNOWN"
+        # Similar extraction logic...
+        if entity != "UNKNOWN":
+            return f"ENTITY:{entity}|ATTR:death_date"
+        else:
+            return "QUERY:death_date_unknown_person"
+
+    # Age questions
+    if "how old" in q:
+        start = q.find("how old is") + len("how old is") if "how old is" in q else q.find("how old") + len("how old")
+        entity = question[start:].strip().strip("?").strip()
+        if entity:
+            return f"ENTITY:{entity}|ATTR:age"
+        else:
+            return "QUERY:age_unknown_person"
+
+    # General information questions
+    if any(start in q for start in ["what is", "what are", "what was", "what were"]):
+        # Extract the main subject
+        subject = q.replace("what is", "").replace("what are", "").replace("what was", "").replace("what were", "").strip("? ")
+        return f"QUERY:what_is_{subject[:30].replace(' ', '_')}"
+
+    # How questions
+    if q.startswith("how"):
+        subject = q.replace("how", "").strip("? ")[:30].replace(" ", "_")
+        return f"QUERY:how_{subject}"
+
+    # Where questions
+    if q.startswith("where"):
+        subject = q.replace("where", "").strip("? ")[:30].replace(" ", "_")
+        return f"QUERY:where_{subject}"
+
+    # Default: use a hash of the question to ensure uniqueness
+    import hashlib
+    question_hash = hashlib.md5(q.encode()).hexdigest()[:8]
+    return f"QUERY:unique_{question_hash}"
 
 
 async def _chat_async(messages, temperature=0.0, model_hint=""):
-    """Call LLMClient, store in llm_cache, and print token usage (closed-book => temp=0.0)."""
+    """Call LLMClient, store in llm_cache, and print token usage with timing"""
+
+    start_time = time.time()
+
+    # Check LLM cache first
+    prompt_text = "\n".join(m["content"] for m in messages)
+    cached_response = llm_cache.approx_get(prompt_text)
+
+    if cached_response:
+        end_time = time.time()
+        duration = end_time - start_time
+        similarity = cached_response.get("similarity", 1.0)
+        print(f"[LLM CACHE HIT] {llm_client.provider.upper()} {model_hint or 'call'} (sim={similarity:.3f}) - cached response in {duration:.2f}s")
+
+        # Still count tokens for tracking (but they're "free")
+        usage = cached_response.get("usage", {})
+        pt = int(usage.get("prompt_tokens", 0))
+        ct = int(usage.get("completion_tokens", 0))
+        tt = int(usage.get("total_tokens", pt + ct))
+        RUN_TOKENS["prompt"] += 0  # Cached = 0 tokens used
+        RUN_TOKENS["completion"] += 0
+        RUN_TOKENS["total"] += 0
+        print(f"    Cached tokens: prompt={pt} completion={ct} total={tt} (0 tokens charged)")
+        return cached_response["output_text"]
+
+    # Make fresh LLM call
     loop = asyncio.get_event_loop()
 
     def _call():
@@ -65,10 +154,13 @@ async def _chat_async(messages, temperature=0.0, model_hint=""):
 
     text, usage = await loop.run_in_executor(None, _call)
 
+    end_time = time.time()
+    duration = end_time - start_time
+
     # persist in LLM cache
     llm_cache.put(
         model=f"{llm_client.provider}:{os.getenv('OPENAI_MODEL') or 'default'}",
-        prompt="\n".join(m["content"] for m in messages),
+        prompt=prompt_text,
         text=text,
         usage=usage or {"hint": model_hint},
     )
@@ -81,7 +173,7 @@ async def _chat_async(messages, temperature=0.0, model_hint=""):
     RUN_TOKENS["completion"] += ct
     RUN_TOKENS["total"] += tt
 
-    print(f"[LLM {llm_client.provider.upper()}] {model_hint or 'call'} tokens: prompt={pt} completion={ct} total={tt}")
+    print(f"[LLM {llm_client.provider.upper()}] {model_hint or 'call'} tokens: prompt={pt} completion={ct} total={tt} in {duration:.2f}s")
     return text
 
 
@@ -89,81 +181,112 @@ async def _chat_async(messages, temperature=0.0, model_hint=""):
 def _loose_json_parse(text: str):
     """Extract a JSON object/array from arbitrary LLM output."""
     raw = text.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    try:
-        return json.loads(raw)
-    except Exception:
-        pass
-
-    def _extract_balanced(s, opener, closer):
-        start = s.find(opener)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(s)):
-            if s[i] == opener:
-                depth += 1
-            elif s[i] == closer:
-                depth -= 1
-                if depth == 0:
-                    return s[start:i+1]
-        return None
-
-    candidate = _extract_balanced(raw, "{", "}")
-    if candidate is None:
-        candidate = _extract_balanced(raw, "[", "]")
-    if candidate:
-        return json.loads(candidate)
-
-    raise ValueError("No JSON object/array found")
+    raw = re.sub(r"^```(?:json)?\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    for start_pos in range(len(raw)):
+        if raw[start_pos] in "{[":
+            for end_pos in range(len(raw) - 1, start_pos - 1, -1):
+                if raw[end_pos] in "}]":
+                    try:
+                        return json.loads(raw[start_pos:end_pos + 1])
+                    except:
+                        continue
+    raise ValueError(f"No valid JSON found in: {text[:200]}...")
 
 
-def purge_answer_for(question: str):
-    cq = canonicalize(question)
-    conn = get_connection()
-    with conn:
-        rows = conn.execute("SELECT id FROM answers WHERE canonical_q=?", (cq,)).fetchall()
+def print_db_stats():
+    """Print cache database statistics."""
+    with get_connection() as conn:
+        answer_count = conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+        plan_count = conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0]
+        llm_count = conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0]
+        print(f"📊 DB stats: answers={answer_count}, plans={plan_count}, llm_cache={llm_count}")
+
+
+def show_counts(when: str):
+    print(f"\n📊 Cache counts ({when}):")
+    print_db_stats()
+
+
+def purge_answer_for(goal: str):
+    """Remove cached answer for a specific goal."""
+    key = improved_canonicalize(goal)
+    print(f"🗑️ Purging cache for: '{goal}' (canonical: '{key}')")
+
+    with get_connection() as conn:
+        # First show what we're about to delete
+        rows = conn.execute("SELECT id, question_text, answer_text FROM answers WHERE canonical_q=?", (key,)).fetchall()
+        for r in rows:
+            print(f"   Deleting: Q='{r[1]}' A='{r[2][:50]}...'")
+
+        # Now delete
         for r in rows:
             conn.execute("DELETE FROM answers_vectors WHERE answer_id=?", (r['id'],))
             conn.execute("DELETE FROM answers WHERE id=?", (r['id'],))
-    print(f"[PURGE] removed cached answer for canonical_q={cq}")
+
+    print(f"✅ Purged {len(rows)} cached answer(s)")
 
 
-def show_counts(stage: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    tables = ["answers", "plans", "llm_cache"]
-    print(f"\n[DB COUNTS] {stage}")
-    for t in tables:
-        cur.execute(f"SELECT COUNT(*) FROM {t}")
-        print(f"  {t:10s}: {cur.fetchone()[0]}")
-    print(f"  db_path   : {DB_PATH}")
-    conn.close()
+def strict_purge_all_wrong_answers():
+    """Emergency purge of obviously wrong cached answers"""
+    print("🚨 EMERGENCY PURGE: Cleaning up wrong cached answers...")
 
+    with get_connection() as conn:
+        # Find answers where the question and answer don't match
+        cursor = conn.execute("""
+            SELECT id, question_text, answer_text, canonical_q
+            FROM answers
+        """)
 
-def _flatten_actions(subgoals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    flat = []
-    for sg in subgoals:
-        for act in sg.get("actions", []) or []:
-            flat.append(act)
-    return flat
+        wrong_answers = []
+        for row in cursor.fetchall():
+            question = row[1].lower()
+            answer = row[2].lower()
 
+            # Check for obvious mismatches
+            if ("current year" in question or "what year" in question) and "born" in answer:
+                wrong_answers.append(row)
+            elif "born" in question and "current" in answer:
+                wrong_answers.append(row)
+            # Add more mismatch patterns as needed
 
-def _print_actions(title: str, subgoals: List[Dict[str, Any]]):
-    print(f"\n🧭 {title}:")
-    for sg in subgoals:
-        print(f"  • Subgoal {sg.get('id', '?')}: {sg.get('title', '').strip()}")
-        actions = sg.get("actions") or []
-        if not actions:
-            print("      (no actions)")
+        print(f"Found {len(wrong_answers)} obviously wrong cached answers:")
+        for row in wrong_answers:
+            print(f"   Q: '{row[1]}' -> A: '{row[2][:50]}...'")
+
+        if wrong_answers:
+            confirm = input("Delete these wrong answers? (y/N): ")
+            if confirm.lower() == 'y':
+                for row in wrong_answers:
+                    conn.execute("DELETE FROM answers_vectors WHERE answer_id=?", (row[0],))
+                    conn.execute("DELETE FROM answers WHERE id=?", (row[0],))
+                print(f"✅ Deleted {len(wrong_answers)} wrong answers")
+            else:
+                print("❌ Cancelled - no answers deleted")
         else:
-            for i, a in enumerate(actions, 1):
-                atype = a.get("action") or a.get("type")
-                # print known fields, stay compact
-                known = {k: v for k, v in a.items() if k in ("action", "type", "url", "selector", "text", "direction")}
-                print(f"      {i}. {atype} {known}")
+            print("✅ No obviously wrong answers found")
+
+
+def _print_actions(title: str, subgoals: List[Dict]):
+    """Pretty-print subgoals and their actions."""
+    print(f"\n🧭 {title}:")
+    for i, sg in enumerate(subgoals, 1):
+        print(f"  • Subgoal {i}: {sg.get('description', 'No description')}")
+        for j, act in enumerate(sg.get("actions", []), 1):
+            atype = act.get("action", "unknown")
+            # Format action details nicely
+            if atype == "goto":
+                url = act.get("url", "")
+                print(f"      {j}. {atype} -> {url}")
+            elif atype == "scroll":
+                direction = act.get("direction", "down")
+                print(f"      {j}. {atype} {direction}")
+            elif atype == "read_page":
+                print(f"      {j}. {atype}")
+            else:
+                # Fallback to show raw action
+                known = {k: v for k, v in act.items() if k != "action"}
+                print(f"      {j}. {atype} {known}")
 
 
 def preview_stored_plan(goal: str):
@@ -177,434 +300,271 @@ def preview_stored_plan(goal: str):
     _print_actions("Stored plan actions", subgoals)
 
 
-def _ensure_wikipedia_url(url: str) -> bool:
-    return "wikipedia.org" in (url or "").lower()
+class ExtendedLLMBrowserAgent(LLMBrowserAgent):
+    """Extended agent with planning and execution capabilities"""
 
+    async def _extract_answer(self, goal: str, all_page_texts: List[str]) -> str:
+        """Extract answer from collected page texts using LLM"""
+        if not all_page_texts:
+            return "No information could be retrieved from Wikipedia."
 
-def _normalize_wiki_url(url: str) -> str:
-    if not url:
-        return url
-    if "wikipedia.org" not in url:
-        return url
-    for bad, good in WIKI_TITLE_FIXES.items():
-        if bad in url:
-            return url.replace(bad, good)
-    return url
+        combined_text = "\n\n".join(all_page_texts)
+        if len(combined_text) > MAX_PAGE_TEXT_CHARS:
+            combined_text = combined_text[:MAX_PAGE_TEXT_CHARS] + "... [truncated]"
 
+        # Debug: Print first part of each page content
+        print(f"\n🔍 DEBUG: Extracted content preview:")
+        for i, text in enumerate(all_page_texts, 1):
+            preview = text[:300].replace('\n', ' ')
+            print(f"   Page {i}: {preview}...")
+            # Look for birth dates specifically
+            if "born" in text.lower() or "birth" in text.lower():
+                import re
+                birth_matches = re.findall(r'born[^\.]*\d{4}[^\.]*', text.lower())
+                if birth_matches:
+                    print(f"   -> Found birth info: {birth_matches[0]}")
 
-async def _goto_with_retry(agent, url: str, retries: int = 2) -> bool:
-    """
-    Navigate with retries. If the page was closed, re-open a new one.
-    Returns True/False for success.
-    """
-    url = _normalize_wiki_url(url)
-    for attempt in range(retries + 1):
-        try:
-            await agent.page.goto(url, wait_until="domcontentloaded")
-            await agent.page.wait_for_load_state("networkidle")
-            return True
-        except Exception as e:
-            err = str(e)
-            print(f"     nav attempt {attempt+1} failed: {err}")
-            # Reopen page if closed
-            if "has been closed" in err or "Target" in err:
-                try:
-                    if agent.browser:
-                        new_page = await agent.browser.new_page()
-                    else:
-                        new_page = await agent.page.context.new_page()
-                    agent.page = new_page
-                    print("     ↻ Reopened a fresh page, retrying…")
-                except Exception as open_err:
-                    print(f"     failed to reopen page: {open_err}")
-            await asyncio.sleep(1.0)
-    return False
-
-
-async def _wiki_search(agent, query: str) -> bool:
-    """Go to Wikipedia search results for query (still on wikipedia)."""
-    q = quote_plus(query.strip())
-    search_url = WIKI_SEARCH + q
-    print(f"   → WIKI SEARCH {query!r} ({search_url})")
-    return await _goto_with_retry(agent, search_url)
-
-
-async def _extract_page_text(page) -> str:
-    # strict: get visible main content only
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
-    text = await page.evaluate(
-        """
-        () => {
-          const kill = (sel) => document.querySelectorAll(sel).forEach(n => n.remove());
-          kill('script,style,nav,header,footer,aside');
-          const main = document.querySelector('#mw-content-text') || document.body;
-          return main.innerText || '';
-        }
-        """
-    )
-    text = (text or "").strip()
-    if len(text) > MAX_PAGE_TEXT_CHARS:
-        text = text[:MAX_PAGE_TEXT_CHARS]
-    return text
-
-
-async def _closed_book_extract(question: str, page_title: str, page_url: str, page_text: str) -> Dict[str, Any]:
-    """
-    Use the LLM ONLY to extract from the provided page_text.
-    If info is not present verbatim in page_text, return found=false.
-    """
-    prompt = f"""
-You are an information extractor. You MUST answer ONLY from the provided PAGE TEXT.
-If the answer is not present verbatim in PAGE TEXT, respond with found=false and answer="".
-
-Return strict JSON with keys: found (boolean), answer (string), evidence (short quote).
-
-QUESTION:
-{question}
-
-PAGE TITLE:
-{page_title}
-
-PAGE URL:
-{page_url}
-
-PAGE TEXT (truncated):
-{page_text}
-"""
-    text = await _chat_async([{"role": "user", "content": prompt}], temperature=0.0, model_hint="closed-book-extract")
-    try:
-        obj = _loose_json_parse(text)
-        if not isinstance(obj, dict):
-            raise ValueError("parsed non-dict")
-        # sanitize
-        obj.setdefault("found", False)
-        obj.setdefault("answer", "")
-        obj.setdefault("evidence", "")
-        return obj
-    except Exception:
-        # very defensive fallback: never fabricate
-        return {"found": False, "answer": "", "evidence": ""}
-
-
-# ---------------- Agent ----------------
-class LLMBrowserAgent:
-    def __init__(self, page, browser=None, verbose: bool = True):
-        self.page = page
-        self.browser = browser
-        self.verbose = verbose
-        self.subgoals: List[dict] = []
-        self.collected_information: List[dict] = []
-
-    async def create_subgoals_and_actions(self, user_goal: str) -> bool:
-        print("\n📋 PLANNING PHASE")
-        print("=" * 60)
-
-        # Try reuse
-        plan_hit = plan_store.approx_get(user_goal, site_domain="wikipedia.org")
-        if plan_hit:
-            subgoals = plan_hit["plan_json"].get("subgoals", [])
-            if subgoals:
-                self.subgoals = subgoals
-                sim = plan_hit.get("similarity", 1.0)
-                print(f"📝 [PLAN LIBRARY HIT] {len(self.subgoals)} subgoals (sim={sim:.3f})")
-                _print_actions("Reused plan actions", self.subgoals)
-                return True
-
-        # Plan with LLM (JSON only)
-        planning_prompt = f"""
-You are a browser-automation planner that must ONLY use Wikipedia.
-Break the goal into 3–5 subgoals; each subgoal MUST include 'actions'.
-Allowed actions:
-- goto(url)  [only wikipedia URLs]
-- type(selector,text)
-- press_enter()
-- click(selector)
-- read_page()
-- scroll(direction)
-
-Prefer search-first strategy:
-1) goto("{WIKI_HOME}/wiki/Main_Page")
-2) type("#searchInput","<query>")
-3) press_enter()
-4) click() the most relevant /wiki/ link
-5) read_page()
-
-Return STRICT JSON ONLY:
-{{
-  "subgoals":[
-    {{
-      "id": 1,
-      "title": "Search for TOPIC on Wikipedia",
-      "actions": [
-        {{ "action": "goto", "url": "{WIKI_HOME}/wiki/Main_Page" }},
-        {{ "action": "type", "selector": "#searchInput", "text": "TOPIC" }},
-        {{ "action": "press_enter" }},
-        {{ "action": "click", "selector": "a[href^='/wiki/']:not([href*=':'])" }},
-        {{ "action": "read_page" }}
-      ]
-    }}
-  ]
-}}
-Goal: "{user_goal}"
-"""
-        text = await _chat_async(
-            [{"role": "user", "content": planning_prompt}],
-            temperature=0.0,
-            model_hint="planning",
-        )
-
-        try:
-            plan_data = _loose_json_parse(text)
-            subgoals = plan_data.get("subgoals", []) if isinstance(plan_data, dict) else []
-            if not subgoals:
-                raise ValueError("No 'subgoals' key")
-            self.subgoals = subgoals
-            print(f"📝 Created {len(self.subgoals)} subgoals.")
-            _print_actions("Created plan actions", self.subgoals)
-
-            plan_json = {"params": {}, "subgoals": self.subgoals, "actions": _flatten_actions(self.subgoals)}
-            plans_repo.put(
-                intent_key="wikipedia_research",
-                goal_text=user_goal,
-                plan_json=plan_json,
-                site_domain="wikipedia.org",
-                success_rate=0.6,
-                version="v1",
-            )
-            print("🗂 Plan stored → plans table (site=wikipedia.org)")
-            return True
-
-        except Exception as e:
-            print("❌ Planning parse failed:", e)
-            print("🔎 RAW LLM planning output (first 600 chars):")
-            print(text[:600])
-
-            # fallback minimal plan (still wiki-only)
-            self.subgoals = [
-                {
-                    "id": 1,
-                    "title": "Open Wikipedia main page",
-                    "actions": [
-                        {"action": "goto", "url": f"{WIKI_HOME}/wiki/Main_Page"},
-                        {"action": "read_page"},
-                    ],
-                }
-            ]
-            print("🛟 Using fallback plan.")
-            _print_actions("Fallback plan actions", self.subgoals)
-
-            plans_repo.put(
-                intent_key="wikipedia_research",
-                goal_text=user_goal,
-                plan_json={"params": {}, "subgoals": self.subgoals, "actions": _flatten_actions(self.subgoals)},
-                site_domain="wikipedia.org",
-                success_rate=0.5,
-                version="v1",
-            )
-            print("🗂 Fallback plan stored → plans table (site=wikipedia.org)")
-            return True
-
-    async def _exec_action(self, action: Dict[str, Any]) -> Optional[str]:
-        """Execute a single action with strict Wikipedia guard. Returns 'read' text or None."""
-        atype = action.get("action") or action.get("type")
-
-        if atype == "goto":
-            url = action.get("url", "")
-            if url and not url.startswith("http"):
-                # treat as title
-                candidate = f"{WIKI_HOME}/wiki/{url.replace(' ', '_')}"
-                print(f"   → normalizing title to URL: {candidate}")
-                url = candidate
-            if STRICT_WIKI_ONLY and not _ensure_wikipedia_url(url):
-                print(f"   ⛔ BLOCKED non-wikipedia goto: {url}")
-                return None
-            url = _normalize_wiki_url(url)
-            print(f"   → GOTO {url}")
-            ok = await _goto_with_retry(self, url)
-            if not ok:
-                # Fallback: try a Wikipedia search using the last path segment as a query
-                topic = (url.rsplit("/", 1)[-1] or "").replace("_", " ")
-                if topic:
-                    print("   → GOTO failed; attempting Wikipedia search fallback…")
-                    await _wiki_search(self, topic)
-            return None
-
-        if atype == "type":
-            sel = action.get("selector", "#searchInput")
-            text = action.get("text", "")
-            print(f"   → TYPE {text!r} into {sel}")
-            try:
-                await self.page.fill(sel, text, timeout=5000)
-            except Exception:
-                # fallback JS fill
-                await self.page.evaluate(
-                    """(s,t)=>{const el=document.querySelector(s); if(el){el.value=''; el.value=t; el.dispatchEvent(new Event('input',{bubbles:true}));}}""",
-                    sel, text
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant that answers questions based ONLY on the provided Wikipedia text. "
+                    "Be concise but thorough. If the information isn't in the provided text, say so clearly. "
+                    "Provide specific dates, facts, and details when available. "
+                    "For comparison questions, look for birth dates in both pieces of content to make the comparison."
                 )
-            return None
+            },
+            {
+                "role": "user",
+                "content": f"Question: {goal}\n\nWikipedia content:\n{combined_text}\n\nAnswer:"
+            }
+        ]
 
-        if atype == "press_enter":
-            print("   → PRESS ENTER")
-            try:
-                await self.page.keyboard.press("Enter")
-                await self.page.wait_for_load_state("networkidle")
-            except Exception:
-                pass
-            return None
+        try:
+            answer = await _chat_async(messages, model_hint="extract_answer")
+            return answer.strip()
+        except Exception as e:
+            print(f"❌ Answer extraction failed: {e}")
+            return f"Error extracting answer: {e}"
 
-        if atype == "click":
-            sel = action.get("selector", "a")
-            print(f"   → CLICK {sel}")
-            try:
-                # Prefer actual article links (avoid namespaces with ':')
-                link = await self.page.query_selector("a[href^='/wiki/']:not([href*=':'])")
-                if link:
-                    await link.click()
-                    await self.page.wait_for_load_state("networkidle")
-                    return None
-                # Fallback to provided selector
-                await self.page.click(sel, timeout=4000)
-                await self.page.wait_for_load_state("networkidle")
-            except Exception as e:
-                print(f"     click failed: {e}")
-            return None
+    async def _create_plan(self, goal: str) -> List[Dict]:
+        """Create a new execution plan for the given goal"""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Wikipedia research planner. Create a plan to answer the user's question using only Wikipedia. "
+                    "Return a JSON array of subgoals, each with a 'description' and 'actions' array. "
+                    "Each action must have this exact format:\n"
+                    "- goto: {\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/PageName\"}\n"
+                    "- read_page: {\"action\": \"read_page\"}\n"
+                    "- scroll: {\"action\": \"scroll\", \"direction\": \"up\" or \"down\"}\n"
+                    "Only use wikipedia.org URLs. Use the actual person/entity names in URLs, not placeholders like PERSON."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Create a research plan to answer: {goal}\n\nExample format:\n[\n  {{\n    \"description\": \"Find information about James Blunt\",\n    \"actions\": [\n      {{\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/James_Blunt\"}},\n      {{\"action\": \"read_page\"}}\n    ]\n  }}\n]"
+            }
+        ]
 
-        if atype == "scroll":
-            direction = action.get("direction", "down").lower()
-            print(f"   → SCROLL {direction}")
-            if direction == "down":
-                await self.page.evaluate("window.scrollBy(0, 800)")
-            else:
-                await self.page.evaluate("window.scrollBy(0, -800)")
-            return None
+        try:
+            response = await _chat_async(messages, model_hint="create_plan")
+            subgoals = _loose_json_parse(response)
 
-        if atype == "read_page":
-            # strict read
-            title = await self.page.title()
-            url = self.page.url
-            if STRICT_WIKI_ONLY and not _ensure_wikipedia_url(url):
-                print(f"   ⛔ BLOCKED non-wikipedia read_page: {url}")
-                return None
-            print(f"   → READ_PAGE ({title[:80]} …)")
-            text = await _extract_page_text(self.page)
-            return json.dumps({"title": title, "url": url, "text": text})  # return packed
+            if not isinstance(subgoals, list):
+                raise ValueError("Plan must be a list of subgoals")
 
-        print(f"   → SKIP unknown action: {atype}")
-        return None
+            # Fix action format if needed
+            for subgoal in subgoals:
+                if "actions" in subgoal:
+                    fixed_actions = []
+                    for action in subgoal["actions"]:
+                        fixed_action = self._normalize_action(action)
+                        if fixed_action:
+                            fixed_actions.append(fixed_action)
+                    subgoal["actions"] = fixed_actions
 
-    async def provide_final_answer(self, user_goal: str):
-        print(f"\n🧩 SYNTHESIZING (no outside facts; only from extracted notes)…")
-        print("=" * 60)
+            return subgoals
 
-        # Only use collected notes that were found=true
-        usable = [info for info in self.collected_information if info.get("found")]
-        if not usable:
-            final_answer = "Information not found on the visited Wikipedia pages."
-        else:
-            # Minimal synthesis without adding new facts
-            lines = []
-            for info in usable:
-                lines.append(f"- {info['answer']}  (source: {info['page_title']})")
-            final_answer = " ".join(lines)
+        except Exception as e:
+            print(f"❌ Plan creation failed: {e}")
+            return []
 
-        print("\n🎯 FINAL ANSWER")
-        print("=" * 80)
-        print(final_answer)
-        print("=" * 80)
+    async def run(self, goal: str, no_cache=False, plan_preview=False, force_plan=False):
+        """Main execution method with robust error handling"""
+        global EXECUTION_START_TIME, TOTAL_EXECUTION_TIME
+        EXECUTION_START_TIME = time.time()
 
-        cq = canonicalize(user_goal)
-        answers_repo.put(
-            canonical_q=cq,
-            question_text=user_goal,
-            answer_text=final_answer,
-            confidence=0.8 if usable else 0.2,
-            evidence={"note": "strict wiki-only; closed-book extraction"},
-            sources=[{"title": info["page_title"], "url": info["page_url"]} for info in self.collected_information],
-        )
-        print(f"💾 Stored answer → answers table (canonical={cq})")
-
-    async def run(self, goal: str, no_cache: bool = False, plan_preview: bool = False, force_plan: bool = False):
         print(f"\n🚀 STARTING AUTOMATION: {goal}")
         print("=" * 60)
         print(f"provider={llm_client.provider.upper()}  db={DB_PATH}")
 
-        # cache
-        if not no_cache and not force_plan:
-            hit = answer_cache.get(goal)
-            if hit:
-                sim = round(hit.get("similarity", 1.0), 4)
-                print("\n[CACHE HIT] (answers)")
-                print("  canonical_q:", hit.get("canonical_q"))
-                print("  similarity :", sim)
-                print("  answer     :", hit["answer_text"])
-                print("  sources    :", hit.get("sources"))
-                if plan_preview:
-                    preview_stored_plan(goal)
-                print(f"\n[RUN TOKENS] prompt={RUN_TOKENS['prompt']} completion={RUN_TOKENS['completion']} total={RUN_TOKENS['total']}")
-                RUN_TOKENS.update({"prompt": 0, "completion": 0, "total": 0})
+        # Check for cached answer first
+        if not force_plan and not no_cache:
+            cache_start = time.time()
+            cached = answer_cache.get(goal)
+            cache_time = time.time() - cache_start
+
+            if cached:
+                TOTAL_EXECUTION_TIME = time.time() - EXECUTION_START_TIME
+                # Fix the canonicalization display
+                canon_key = improved_canonicalize(goal)
+                cached_copy = cached.copy()
+                cached_copy['canonical_q'] = canon_key
+                print(f"✅ [ANSWER CACHE HIT] {cached_copy} (retrieved in {cache_time:.3f}s)")
+                print(f"📊 TOTAL EXECUTION TIME: {TOTAL_EXECUTION_TIME:.2f}s | TOKENS: prompt=0 completion=0 total=0 (cached)")
                 return
 
-        # go to Wikipedia home
-        await self.page.goto(f"{WIKI_HOME}/wiki/Main_Page", wait_until="domcontentloaded")
-        await self.page.wait_for_load_state("networkidle")
+        # Plan preview
+        if plan_preview:
+            preview_stored_plan(goal)
 
-        if not await self.create_subgoals_and_actions(goal):
-            print("❌ Planning failed.")
-            return
+        # Check for cached plan
+        print(f"\n📋 PLANNING PHASE")
+        print("=" * 60)
 
-        # Execute plan strictly; collect notes via closed-book extraction
-        for sg in self.subgoals:
-            print(f"\n▶ Subgoal {sg.get('id','?')}: {sg.get('title','').strip()}")
-            actions = sg.get("actions") or []
-            if not actions:
-                print("   (no actions)")
-                continue
+        plan_start = time.time()
+        plan_hit = None
+        if not force_plan:
+            # Use canonicalized goal for plan lookup to ensure proper matching
+            canonical_goal = improved_canonicalize(goal)
+            print(f"📝 [PLAN LOOKUP] Using canonical goal: '{canonical_goal}'")
+            plan_hit = plan_store.approx_get(canonical_goal, site_domain="wikipedia.org")
+            if plan_hit:
+                similarity = plan_hit.get("similarity", 1.0)
+                print(f"📝 [PLAN CACHE DEBUG] Found plan similarity={similarity:.3f}")
+                if similarity >= 0.95:  # Much higher threshold to prevent wrong matches
+                    plan_time = time.time() - plan_start
+                    print(f"📝 [PLAN LIBRARY HIT] {len(plan_hit['plan_json'].get('subgoals', []))} subgoals (sim={similarity:.3f}) in {plan_time:.3f}s")
+                else:
+                    print(f"📝 [PLAN CACHE MISS] Similarity {similarity:.3f} below threshold 0.95")
+                    plan_hit = None
+            else:
+                plan_time = time.time() - plan_start
+                print(f"📝 [PLAN CACHE MISS] No similar plans found (search took {plan_time:.3f}s)")
 
-            last_read_pack = None
-            for i, a in enumerate(actions, 1):
-                atype = a.get("action") or a.get("type")
-                print(f"   [{i}] EXECUTE {atype} …")
-                result = await self._exec_action(a)
-                if atype == "read_page" and result:
-                    last_read_pack = json.loads(result)
+        if plan_hit:
+            subgoals = plan_hit["plan_json"].get("subgoals", [])
+            _print_actions("Reused plan actions", subgoals)
+        else:
+            # Create new plan
+            print("📝 [CREATING NEW PLAN]")
+            plan_creation_start = time.time()
+            subgoals = await self._create_plan(goal)
+            plan_creation_time = time.time() - plan_creation_start
 
-            # If we read a page in this subgoal, attempt closed-book extraction from it
-            if last_read_pack:
-                page_title = last_read_pack.get("title", "")
-                page_url = last_read_pack.get("url", "")
-                page_text = last_read_pack.get("text", "")
+            if not subgoals:
+                print("❌ Failed to create plan")
+                return
 
-                # closed-book extraction on the current page
-                extracted = await _closed_book_extract(goal, page_title, page_url, page_text)
-                self.collected_information.append({
-                    "subgoal_id": sg.get("id", len(self.collected_information) + 1),
-                    "subgoal_title": sg.get("title", "step"),
-                    "found": bool(extracted.get("found")),
-                    "answer": extracted.get("answer", ""),
-                    "evidence": extracted.get("evidence", ""),
-                    "page_title": page_title,
-                    "page_url": page_url,
-                })
-                status = "FOUND" if extracted.get("found") else "NOT FOUND"
-                print(f"   → EXTRACT [{status}] {extracted.get('answer','')!r}  evidence: {extracted.get('evidence','')!r}")
+            _print_actions("New plan actions", subgoals)
+            print(f"📝 [PLAN CREATED] in {plan_creation_time:.3f}s")
 
-        await self.provide_final_answer(goal)
+            # Store the plan with canonicalized intent key
+            canonical_intent = improved_canonicalize(goal)
+            plan_store.put(
+                intent_key=canonical_intent,  # Use canonicalized key to prevent wrong matches
+                goal_text=goal,
+                plan_json={"subgoals": subgoals},
+                site_domain="wikipedia.org"
+            )
+            print(f"📝 [PLAN STORED] with intent_key='{canonical_intent}'")
 
-        print(f"\n[RUN TOKENS] prompt={RUN_TOKENS['prompt']} completion={RUN_TOKENS['completion']} total={RUN_TOKENS['total']}")
-        RUN_TOKENS.update({"prompt": 0, "completion": 0, "total": 0})
+        # Execute the plan
+        print(f"\n🎬 EXECUTION PHASE")
+        print("=" * 60)
+
+        execution_start = time.time()
+        all_page_texts = []
+
+        for i, subgoal in enumerate(subgoals, 1):
+            subgoal_start = time.time()
+            print(f"\n▶ Subgoal {i}: {subgoal.get('description', 'No description')}")
+
+            # Check browser health before each subgoal
+            if not await self.check_browser_health():
+                print(f"❌ Browser connection lost before subgoal {i}")
+                break
+
+            actions = subgoal.get("actions", [])
+            for j, action in enumerate(actions, 1):
+                action_start = time.time()
+                print(f"   [{j}] EXECUTE {action.get('action', 'unknown')} …")
+
+                try:
+                    result = await self._exec_action(action)
+                    action_time = time.time() - action_start
+
+                    if result is None:
+                        print(f"   ❌ Action failed in {action_time:.3f}s, continuing...")
+                        continue
+                    elif isinstance(result, str) and len(result) > 100:
+                        # This is page text content
+                        all_page_texts.append(result)
+                        print(f"   ✅ Collected page content ({len(result)} chars) in {action_time:.3f}s")
+                    elif result:
+                        print(f"   ✅ Action completed successfully in {action_time:.3f}s")
+                    else:
+                        print(f"   ⚠️ Action completed with warnings in {action_time:.3f}s")
+
+                except Exception as e:
+                    action_time = time.time() - action_start
+                    print(f"   ❌ Action execution error in {action_time:.3f}s: {e}")
+                    continue
+
+            subgoal_time = time.time() - subgoal_start
+            print(f"   ⏱️ Subgoal {i} completed in {subgoal_time:.3f}s")
+
+        execution_time = time.time() - execution_start
+        print(f"🎬 [EXECUTION COMPLETED] in {execution_time:.3f}s")
+
+        # Extract final answer
+        print(f"\n🧠 ANSWER EXTRACTION")
+        print("=" * 60)
+
+        if all_page_texts:
+            extraction_start = time.time()
+            print(f"📖 Extracting answer from {len(all_page_texts)} page(s) of content...")
+            final_answer = await self._extract_answer(goal, all_page_texts)
+            extraction_time = time.time() - extraction_start
+            print(f"🧠 [EXTRACTION COMPLETED] in {extraction_time:.3f}s")
+
+            # Cache the answer
+            if not no_cache:
+                answer_cache.put(goal, final_answer)
+
+            print(f"\n✅ FINAL ANSWER:")
+            print("=" * 60)
+            print(final_answer)
+        else:
+            error_msg = "❌ No content was successfully retrieved from Wikipedia."
+            print(error_msg)
+            if not no_cache:
+                answer_cache.put(goal, error_msg)
+
+        # Print comprehensive timing and token summary
+        TOTAL_EXECUTION_TIME = time.time() - EXECUTION_START_TIME
+        print(f"\n📊 EXECUTION SUMMARY:")
+        print("=" * 60)
+        print(f"⏱️  TOTAL TIME: {TOTAL_EXECUTION_TIME:.2f}s")
+        print(f"🎯 TOKENS USED: prompt={RUN_TOKENS['prompt']} completion={RUN_TOKENS['completion']} total={RUN_TOKENS['total']}")
+        if RUN_TOKENS['total'] > 0:
+            cost_estimate = (RUN_TOKENS['prompt'] * 0.0000015) + (RUN_TOKENS['completion'] * 0.000006)  # GPT-4o-mini pricing
+            print(f"💰 ESTIMATED COST: ${cost_estimate:.4f}")
+        else:
+            print(f"💰 ESTIMATED COST: $0.0000 (cached)")
+        print("=" * 60)
 
 
-# ---------------- CLI ----------------
 async def main():
-    ap = argparse.ArgumentParser(description="CLI Browser Agent (OpenAI LLM + Lightpanda browser + STRICT WIKIPEDIA ONLY)")
-    ap.add_argument("goal", nargs="*", help='Goal, e.g. "When was Marie Curie born?"')
+    ap = argparse.ArgumentParser(description="LLM-powered Wikipedia research agent")
+    ap.add_argument("goal", nargs="*", help='Research goal (e.g., "When was Marie Curie born?")')
     ap.add_argument("--no-cache", action="store_true", help="Bypass answer cache")
     ap.add_argument("--force-plan", action="store_true", help="Skip answer cache and force planning/execution")
     ap.add_argument("--plan-preview", action="store_true", help="Print stored plan actions even on cache hit")
     ap.add_argument("--purge", action="store_true", help="Purge cached answer for the given goal")
+    ap.add_argument("--emergency-purge", action="store_true", help="Emergency purge of obviously wrong cached answers")
     ap.add_argument("--show-counts", action="store_true", help="Print DB table counts before/after")
     ap.add_argument("--headless", action="store_true", help="Use local headless Chromium if Lightpanda fails")
     args = ap.parse_args()
@@ -613,28 +573,58 @@ async def main():
 
     if args.purge:
         purge_answer_for(goal)
+        return
+
+    if args.emergency_purge:
+        strict_purge_all_wrong_answers()
+        return
 
     if args.show_counts:
         show_counts("before")
 
     token = os.getenv("LIGHTPANDA_TOKEN")
-    async with async_playwright() as p:
-        try:
-            if token:
-                print("Connecting to Lightpanda browser…")
-                browser = await p.chromium.connect_over_cdp(f"wss://cloud.lightpanda.io/ws?token={token}")
-                print("✅ Connected to Lightpanda.")
-            else:
-                raise RuntimeError("No LIGHTPANDA_TOKEN in env")
-        except Exception as e:
-            print("❌ Lightpanda connection failed:", e)
-            print("Launching local Chromium instead…")
-            browser = await p.chromium.launch(headless=args.headless)
+    agent = None
 
-        page = await browser.new_page()
-        agent = LLMBrowserAgent(page=page, browser=browser)
-        await agent.run(goal, no_cache=args.no_cache, plan_preview=args.plan_preview, force_plan=args.force_plan)
-        await browser.close()
+    try:
+        # Initialize playwright context
+        async with async_playwright() as p:
+            browser = None
+
+            # Try connecting to Lightpanda first
+            if token:
+                try:
+                    print("Connecting to Lightpanda browser…")
+                    browser = await p.chromium.connect_over_cdp(f"wss://cloud.lightpanda.io/ws?token={token}")
+                    print("✅ Connected to Lightpanda.")
+                except Exception as e:
+                    print("❌ Lightpanda connection failed:", e)
+                    browser = None
+
+            # Fallback to local browser
+            if not browser:
+                print("Launching local Chromium instead…")
+                browser = await p.chromium.launch(headless=args.headless)
+
+            page = await browser.new_page()
+
+            # Create agent with browser references
+            agent = ExtendedLLMBrowserAgent(page=page, browser=browser)
+            agent.use_headless = args.headless
+            agent.token = token
+            agent.playwright_context = p
+            agent.playwright_instance = p
+
+            # Run the automation
+            await agent.run(goal, no_cache=args.no_cache, plan_preview=args.plan_preview, force_plan=args.force_plan)
+
+            # Cleanup
+            await browser.close()
+
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+    finally:
+        if agent:
+            await agent.cleanup()
 
     if args.show_counts:
         show_counts("after")
