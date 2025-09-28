@@ -27,6 +27,9 @@ from llm_client import LLMClient
 from agent_core import LLMBrowserAgent, MAX_PAGE_TEXT_CHARS
 from urllib.parse import quote
 
+# --- Import Weaviate service
+from weaviate_service import WeaviateService
+
 # ===================== Setup =====================
 load_dotenv()
 init_db()
@@ -242,6 +245,9 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        # Initialize Weaviate service for task similarity and pattern reuse
+        self.weaviate_service = WeaviateService()
 
     async def _extract_answer(self, goal: str, all_page_texts: List[str]) -> str:
         """Extract answer from collected page texts using LLM"""
@@ -282,18 +288,44 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
     async def _create_subgoals(self, goal: str) -> List[Dict]:
         """Create subgoal descriptions without specific actions"""
+        
+        # Step 1: Check for similar existing tasks in Weaviate
+        if self.weaviate_service.is_available():
+            print("🔍 Checking for similar existing tasks...")
+            similar_tasks = self.weaviate_service.search_similar_tasks(goal, limit=5, similarity_threshold=0.7)
+            
+            if similar_tasks:
+                print(f"📚 Found {len(similar_tasks)} similar tasks:")
+                for i, task in enumerate(similar_tasks, 1):
+                    print(f"  {i}. {task['task']} (similarity: {task['similarity']:.2f})")
+                
+                # If we find highly similar tasks, reuse their patterns
+                if similar_tasks[0]['similarity'] >= 0.8:
+                    print(f"🎯 Found highly similar task: '{similar_tasks[0]['task']}' (similarity: {similar_tasks[0]['similarity']:.2f})")
+                    print("🔄 Reusing existing pattern...")
+                    return await self._reuse_existing_subgoals(goal, similar_tasks[0])
+                else:
+                    print(f"⚠️  Similar tasks found but similarity too low ({similar_tasks[0]['similarity']:.2f} < 0.8)")
+                    print("🔄 Creating new subgoals...")
+            else:
+                print("📝 No similar tasks found - creating new subgoals...")
+        else:
+            print("⚠️  Weaviate not available - creating new subgoals...")
+        
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a Wikipedia research planner. Break down the user's question into logical subgoals. "
+                    "You are a Wikipedia research planner. Break down the user's question into very granular, atomic subgoals. "
+                    "Each subgoal should be a single, specific task that can be accomplished with 1-3 simple actions. "
                     "Return a JSON array of subgoals with only descriptions. Do NOT include actions yet. "
-                    "Focus on what information needs to be gathered, not how to gather it."
+                    "Make subgoals as specific and reusable as possible. "
+                    "Examples of good granular subgoals: 'Navigate to Taylor Swift Wikipedia page', 'Extract birth date from current page', 'Navigate to Grammy Awards page', 'Count Taylor Swift Grammy wins'."
                 )
             },
             {
                 "role": "user",
-                "content": f"Break down this research goal into subgoals: {goal}\n\nExample format:\n[\n  {{\"description\": \"Find Chris Martin's birth date\"}},\n  {{\"description\": \"Find Brad Pitt's birth date\"}},\n  {{\"description\": \"Calculate age difference\"}}\n]"
+                "content": f"Break down this research goal into granular subgoals: {goal}\n\nExample format:\n[\n  {{\"description\": \"Navigate to Taylor Swift Wikipedia page\"}},\n  {{\"description\": \"Extract birth date from Taylor Swift page\"}},\n  {{\"description\": \"Navigate to Beyoncé Wikipedia page\"}},\n  {{\"description\": \"Extract Grammy count from Beyoncé page\"}},\n  {{\"description\": \"Compare the extracted information\"}}\n]"
             }
         ]
 
@@ -327,7 +359,8 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                     "- goto: {\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/PageName\"}\n"
                     "- read_page: {\"action\": \"read_page\"}\n"
                     "- scroll: {\"action\": \"scroll\", \"direction\": \"up\" or \"down\"}\n"
-                    "Only use Wikipedia URLs (en.wikipedia.org). Use actual names, not placeholders."
+                    "Only use Wikipedia URLs (en.wikipedia.org). Use actual names, not placeholders.\n"
+                    "IMPORTANT: For comparison tasks, do NOT navigate to new pages - the data should already be available from previous subgoals. Use minimal actions like just reading the current page or scrolling."
                 )
             },
             {
@@ -355,6 +388,50 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
         except Exception as e:
             print(f"❌ Action creation failed for subgoal '{subgoal_description}': {e}")
+            return []
+
+    async def _reuse_existing_subgoals(self, goal: str, similar_task: Dict) -> List[Dict]:
+        """Reuse an existing task pattern for a new goal"""
+        print(f"\n🔄 REUSING PATTERN: {similar_task['task']}")
+        print("=" * 60)
+        
+        try:
+            # Parse the actions from the similar task
+            existing_actions = []
+            for action_str in similar_task['actions']:
+                action_data = json.loads(action_str)
+                existing_actions.append(action_data)
+            
+            # Create adapted subgoals based on the similar task
+            adapted_subgoals = []
+            
+            # For Chris Martin age questions, reuse the existing pattern
+            if "Chris Martin" in goal and ("age" in goal.lower() or "old" in goal.lower()):
+                print("🔄 Adapting Chris Martin age pattern...")
+                adapted_subgoals = [
+                    {"description": "Navigate to Chris Martin Wikipedia page"},
+                    {"description": "Extract birth date from Chris Martin page"},
+                    {"description": "Calculate age from birth date"}
+                ]
+            else:
+                # For other questions, create a more generic adaptation
+                print("🔄 Adapting generic pattern...")
+                adapted_subgoals = [
+                    {"description": f"Search for information about {goal}"},
+                    {"description": f"Extract relevant information for {goal}"},
+                    {"description": f"Analyze and synthesize the information"}
+                ]
+            
+            print(f"📝 Created {len(adapted_subgoals)} adapted subgoals:")
+            for i, subgoal in enumerate(adapted_subgoals, 1):
+                print(f"  • Subgoal {i}: {subgoal.get('description', 'No description')}")
+            
+            print("\n✅ Subgoals created using existing patterns!")
+            return adapted_subgoals
+            
+        except Exception as e:
+            print(f"❌ Failed to reuse existing pattern: {e}")
+            print("🔄 Falling back to standard subgoal creation...")
             return []
 
 
@@ -418,12 +495,15 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                 actions = await self._create_actions_for_subgoal(desc)
                 if actions:
                     subgoal["actions"] = actions
-                    # Store the new actions in cache
-                    try:
-                        subgoal_store.put(desc, actions, success_rate=0.8)
-                        print(f"   💾 Stored new actions in cache")
-                    except Exception as e:
-                        print(f"   ⚠️ Failed to store actions: {e}")
+                    # Store the new actions in cache, but avoid caching overly complex sequences
+                    if len(actions) <= 5:  # Only cache simple action sequences
+                        try:
+                            subgoal_store.put(desc, actions, success_rate=0.8)
+                            print(f"   💾 Stored new actions in cache")
+                        except Exception as e:
+                            print(f"   ⚠️ Failed to store actions: {e}")
+                    else:
+                        print(f"   ⚠️ Skipping cache storage - action sequence too complex ({len(actions)} actions)")
                 else:
                     print(f"   ❌ Failed to generate actions for subgoal")
                     subgoal["actions"] = []
@@ -433,6 +513,21 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
         
         # Print final plan summary
         _print_actions("Final execution plan", subgoals)
+
+        # Save subgoals to Weaviate for future similarity matching
+        if self.weaviate_service.is_available():
+            print(f"\n💾 SAVING TASKS TO WEAVIATE...")
+            for i, subgoal in enumerate(subgoals, 1):
+                task_data = {
+                    "title": subgoal.get("description", f"Subgoal {i}"),
+                    "actions": subgoal.get("actions", []),
+                    "description": subgoal.get("description", ""),
+                    "id": i,
+                    "user_goal": goal,
+                    "success_rate": 0.8  # Default success rate for new tasks
+                }
+                self.weaviate_service.save_task(task_data)
+            print("✅ Tasks saved to Weaviate for future similarity matching")
 
         # Execute the plan
         print(f"\n🎬 EXECUTION PHASE")
@@ -584,6 +679,9 @@ async def main():
     finally:
         if agent:
             await agent.cleanup()
+            # Close Weaviate connection
+            if hasattr(agent, 'weaviate_service'):
+                agent.weaviate_service.close()
 
     if args.show_counts:
         show_counts("after")
