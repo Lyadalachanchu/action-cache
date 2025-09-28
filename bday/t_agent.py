@@ -12,13 +12,18 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 # --- DB + cache
-from cachedb.db import init_db, get_connection
-from cachedb.repos import AnswersRepo, PlansRepo, LLMRepo
+from cachedb.weaviate_repos import (
+    AnswersRepo,
+    PlansRepo,
+    LLMRepo,
+    init_weaviate_collections,
+)
 from cachedb_integrations.cache_adapters import (
     SubgoalStoreAdapter as SubgoalStore,
     LLMCacheAdapter as LLMCache,
 )
-from cachedb.config import DB_PATH
+from cachedb import config as cachedb_config
+from cachedb.migrate_from_json import canonicalize
 
 # --- Provider-agnostic LLM client
 from llm_client import LLMClient
@@ -29,7 +34,7 @@ from urllib.parse import quote
 
 # ===================== Setup =====================
 load_dotenv()
-init_db()
+init_weaviate_collections()
 
 answers_repo = AnswersRepo()
 plans_repo = PlansRepo()
@@ -58,8 +63,8 @@ async def _chat_async(messages, temperature=0.0, model_hint="", bypass_cache=Fal
 
     # Check LLM cache first (unless bypassed)
     cached_response = None
+    prompt_text = "\n".join(m["content"] for m in messages)
     if not bypass_cache:
-        prompt_text = "\n".join(m["content"] for m in messages)
         cached_response = llm_cache.approx_get(prompt_text)
 
     if cached_response:
@@ -92,8 +97,6 @@ async def _chat_async(messages, temperature=0.0, model_hint="", bypass_cache=Fal
 
     # persist in LLM cache (unless bypassed)
     if not bypass_cache:
-        if 'prompt_text' not in locals():
-            prompt_text = "\n".join(m["content"] for m in messages)
         llm_cache.put(
             model=f"{llm_client.provider}:{os.getenv('OPENAI_MODEL') or 'default'}",
             prompt=prompt_text,
@@ -132,11 +135,10 @@ def _loose_json_parse(text: str):
 
 def print_db_stats():
     """Print cache database statistics."""
-    with get_connection() as conn:
-        answer_count = conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
-        plan_count = conn.execute("SELECT COUNT(*) FROM plans").fetchone()[0]
-        llm_count = conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0]
-        print(f"📊 DB stats: answers={answer_count}, plans={plan_count}, llm_cache={llm_count}")
+    answer_count = answers_repo.count()
+    plan_count = plans_repo.count()
+    llm_count = llm_repo.count()
+    print(f"📊 Cache stats: answers={answer_count}, plans={plan_count}, llm_cache={llm_count}")
 
 
 def show_counts(when: str):
@@ -146,62 +148,63 @@ def show_counts(when: str):
 
 def purge_answer_for(goal: str):
     """Remove cached answer for a specific goal."""
-    import hashlib
-    key = f"QUERY:unique_{hashlib.md5(goal.lower().encode()).hexdigest()[:8]}"
-    print(f"🗑️ Purging cache for: '{goal}' (canonical: '{key}')")
+    canonical_q = canonicalize(goal)
+    print(f"🗑️ Purging cache for: '{goal}' (canonical: '{canonical_q}')")
 
-    with get_connection() as conn:
-        # First show what we're about to delete
-        rows = conn.execute("SELECT id, question_text, answer_text FROM answers WHERE canonical_q=?", (key,)).fetchall()
-        for r in rows:
-            print(f"   Deleting: Q='{r[1]}' A='{r[2][:50]}...'")
+    matches = answers_repo.fetch_by_canonical(
+        canonical_q,
+        return_properties=["question_text", "answer_text", "canonical_q"],
+    )
 
-        # Now delete
-        for r in rows:
-            conn.execute("DELETE FROM answers_vectors WHERE answer_id=?", (r['id'],))
-            conn.execute("DELETE FROM answers WHERE id=?", (r['id'],))
+    if not matches:
+        print("   No cached answers found for this canonical key.")
+        return
 
-    print(f"✅ Purged {len(rows)} cached answer(s)")
+    for row in matches:
+        question = row.get("question_text", "")
+        answer = row.get("answer_text", "")
+        print(f"   Deleting: Q='{question}' A='{answer[:50]}...'")
+
+    deleted = answers_repo.delete_by_canonical(canonical_q)
+    print(f"✅ Purged {deleted} cached answer(s)")
 
 
 def strict_purge_all_wrong_answers():
     """Emergency purge of obviously wrong cached answers"""
     print("🚨 EMERGENCY PURGE: Cleaning up wrong cached answers...")
 
-    with get_connection() as conn:
-        # Find answers where the question and answer don't match
-        cursor = conn.execute("""
-            SELECT id, question_text, answer_text, canonical_q
-            FROM answers
-        """)
+    wrong_answers = []
+    for row in answers_repo.iter_question_answer_pairs(
+        return_properties=["canonical_q", "question_text", "answer_text"]
+    ):
+        question = (row.get("question_text") or "").lower()
+        answer = (row.get("answer_text") or "").lower()
 
-        wrong_answers = []
-        for row in cursor.fetchall():
-            question = row[1].lower()
-            answer = row[2].lower()
+        if ("current year" in question or "what year" in question) and "born" in answer:
+            wrong_answers.append(row)
+        elif "born" in question and "current" in answer:
+            wrong_answers.append(row)
 
-            # Check for obvious mismatches
-            if ("current year" in question or "what year" in question) and "born" in answer:
-                wrong_answers.append(row)
-            elif "born" in question and "current" in answer:
-                wrong_answers.append(row)
-            # Add more mismatch patterns as needed
+    print(f"Found {len(wrong_answers)} obviously wrong cached answers:")
+    for row in wrong_answers:
+        print(f"   Q: '{row.get('question_text', '')}' -> A: '{(row.get('answer_text', '')[:50])}...'")
 
-        print(f"Found {len(wrong_answers)} obviously wrong cached answers:")
-        for row in wrong_answers:
-            print(f"   Q: '{row[1]}' -> A: '{row[2][:50]}...'")
-
-        if wrong_answers:
-            confirm = input("Delete these wrong answers? (y/N): ")
-            if confirm.lower() == 'y':
-                for row in wrong_answers:
-                    conn.execute("DELETE FROM answers_vectors WHERE answer_id=?", (row[0],))
-                    conn.execute("DELETE FROM answers WHERE id=?", (row[0],))
-                print(f"✅ Deleted {len(wrong_answers)} wrong answers")
-            else:
-                print("❌ Cancelled - no answers deleted")
+    if wrong_answers:
+        confirm = input("Delete these wrong answers? (y/N): ")
+        if confirm.lower() == 'y':
+            keys = {
+                row.get("canonical_q")
+                for row in wrong_answers
+                if row.get("canonical_q")
+            }
+            total_deleted = 0
+            for key in keys:
+                total_deleted += answers_repo.delete_by_canonical(key)
+            print(f"✅ Deleted {total_deleted} wrong answers")
         else:
-            print("✅ No obviously wrong answers found")
+            print("❌ Cancelled - no answers deleted")
+    else:
+        print("✅ No obviously wrong answers found")
 
 
 def _print_actions(title: str, subgoals: List[Dict]):
@@ -370,7 +373,8 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
         print(f"\n🚀 STARTING AUTOMATION: {goal}")
         print("=" * 60)
-        print(f"provider={llm_client.provider.upper()}  db={DB_PATH}")
+        backend = getattr(cachedb_config, "WEAVIATE_URL", None) or "weaviate"
+        print(f"provider={getattr(llm_client, 'provider', 'unknown').upper()}  backend={backend}")
 
         # No answer-level cache: always compute using subgoal cache only
 
@@ -390,7 +394,7 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
         if not subgoals:
             print("❌ Failed to create subgoals")
             return
-        
+
         print(f"📝 Generated {len(subgoals)} subgoals:")
         for i, sg in enumerate(subgoals, 1):
             print(f"  • Subgoal {i}: {sg.get('description', 'No description')}")
@@ -399,16 +403,16 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
         # Phase 2: Get or create actions for each subgoal
         print(f"\n🔧 ACTION PLANNING PHASE")
         print("=" * 60)
-        
+
         action_planning_start = time.time()
         for i, subgoal in enumerate(subgoals, 1):
             desc = subgoal.get("description", "")
             print(f"\n▶ Planning actions for subgoal {i}: {desc}")
-            
+
             # Check if we have cached actions for this subgoal
             cached_sg = subgoal_store.approx_get(desc)
             similarity_threshold = 0.75  # Balanced threshold for action reuse
-            
+
             if cached_sg and not force_plan and cached_sg.get('similarity', 0) >= similarity_threshold:
                 actions = cached_sg.get("actions", [])
                 print(f"   📦 Using cached actions (sim={cached_sg.get('similarity',1):.3f})")
@@ -433,10 +437,10 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                 else:
                     print(f"   ❌ Failed to generate actions for subgoal")
                     subgoal["actions"] = []
-        
+
         action_planning_time = time.time() - action_planning_start
         print(f"🔧 [ACTION PLANNING COMPLETED] in {action_planning_time:.3f}s")
-        
+
         # Print final plan summary
         _print_actions("Final execution plan", subgoals)
 

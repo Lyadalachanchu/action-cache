@@ -14,8 +14,13 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 import time
 
+# Prefer Weaviate-backed repositories when available
+try:
+    from cachedb.weaviate_repos import AnswersRepo, PlansRepo, LLMRepo
+except ImportError:  # pragma: no cover - fallback for environments without weaviate
+    from cachedb.repos import AnswersRepo, PlansRepo, LLMRepo
+
 from cachedb.resolver import get_answer, get_plan
-from cachedb.repos import AnswersRepo, PlansRepo, LLMRepo
 from cachedb.migrate_from_json import canonicalize
 
 # ---------------------------- Answer Cache -----------------------------------

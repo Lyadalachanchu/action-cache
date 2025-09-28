@@ -1,6 +1,11 @@
 # cachedb/resolver.py
 from typing import Optional, Dict, Any
-from .repos import AnswersRepo, PlansRepo, LLMRepo, DOMRepo
+# Prefer Weaviate repos when available, but always fall back to SQLite.
+try:
+    from .weaviate_repos import AnswersRepo, PlansRepo, LLMRepo  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    from .repos import AnswersRepo, PlansRepo, LLMRepo
+from .repos import DOMRepo
 from .migrate_from_json import canonicalize
 
 answers = AnswersRepo()

@@ -10,7 +10,11 @@ Looks for these files (override via env vars):
 import os, json, time
 from pathlib import Path
 from .db import init_db
-from .repos import AnswersRepo, PlansRepo, LLMRepo
+# Prefer Weaviate repos when available to populate remote cache.
+try:
+    from .weaviate_repos import AnswersRepo, PlansRepo, LLMRepo  # type: ignore
+except Exception:
+    from .repos import AnswersRepo, PlansRepo, LLMRepo
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 

@@ -7,7 +7,11 @@ Quickstart for the hybrid cache DB.
 from .db import init_db
 from .migrate_from_json import run as migrate_run
 from .resolver import get_answer, get_plan, robust_click_hint
-from .repos import AnswersRepo, PlansRepo, DOMRepo
+try:
+    from .weaviate_repos import AnswersRepo, PlansRepo  # type: ignore
+except Exception:
+    from .repos import AnswersRepo, PlansRepo
+from .repos import DOMRepo
 
 def main():
     init_db()
