@@ -7,7 +7,6 @@ from cachedb_integrations.cache_adapters import (
 )
 
 # Use absolute import when running as a script
-import dom_extractors  # noqa: F401  (imported for side effects / future use)
 
 class LLMBrowserAgent:
     def __init__(self):
