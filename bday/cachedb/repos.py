@@ -138,14 +138,9 @@ class PlansRepo:
             )
         return plan_id
 
-    def approx_get(self, goal_text: str, site_domain: Optional[str] = None, top_k: int = 5) -> Optional[dict]:
+    def approx_get(self, goal_text: str, top_k: int = 5) -> Optional[dict]:
         conn = get_connection()
-        params = [goal_text]
-        query = "SELECT * FROM plans WHERE goal_text = ?"
-        if site_domain:
-            query += " AND (site_domain IS NULL OR site_domain = ?)"
-            params.append(site_domain)
-        cur = conn.execute(query, params)
+        cur = conn.execute("SELECT * FROM plans WHERE goal_text = ?", (goal_text,))
         row = cur.fetchone()
         if row:
             return {
@@ -162,8 +157,6 @@ class PlansRepo:
         cur = conn.execute("SELECT p.*, pv.goal_vec_json FROM plans p JOIN plans_vectors pv ON p.id = pv.plan_id")
         best, best_sim = None, -1.0
         for r in cur.fetchall():
-            if site_domain and r["site_domain"] and r["site_domain"] != site_domain:
-                continue
             v = json.loads(r["goal_vec_json"])
             sim = cosine(q, v) * (0.9 + 0.2 * float(r["success_rate"] or 0.5))  # favor successful plans
             if sim > best_sim:

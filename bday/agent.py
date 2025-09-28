@@ -24,10 +24,10 @@ class LLMBrowserAgent:
             return hit["answer_text"]
 
         # 2) Check for reusable plan
-        plan = self.plan_store.approx_get(goal, site_domain="wikipedia.org")
+        plan = self.plan_store.approx_get(goal)
         if plan:
             print(f"[PLAN] Found plan template: {plan['intent_key']}")
-            # You’d execute plan["plan_json"]["actions"] here
+            # You'd execute plan["plan_json"]["actions"] here
             # For now, just print them
             for step in plan["plan_json"].get("actions", []):
                 print(" →", step)

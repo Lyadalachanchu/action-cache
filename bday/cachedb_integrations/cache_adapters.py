@@ -50,8 +50,8 @@ class PlanStoreAdapter:
     def __init__(self):
         self.repo = PlansRepo()
 
-    def approx_get(self, goal_text: str, site_domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        return get_plan(goal_text, site_domain=site_domain)
+    def approx_get(self, goal_text: str) -> Optional[Dict[str, Any]]:
+        return get_plan(goal_text)
 
     def put(self, intent_key: str, goal_text: str, plan_json: Dict[str, Any],
             site_domain: Optional[str] = None, env_fingerprint: Optional[str] = None,
@@ -103,8 +103,8 @@ class SubgoalStoreAdapter:
     def __init__(self):
         self.repo = PlansRepo()
 
-    def approx_get(self, description: str, site_domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        hit = self.repo.approx_get(description, site_domain=site_domain)
+    def approx_get(self, description: str) -> Optional[Dict[str, Any]]:
+        hit = self.repo.approx_get(description)
         if not hit:
             return None
         pj = hit.get("plan_json", {})
@@ -114,43 +114,11 @@ class SubgoalStoreAdapter:
         return {"description": hit.get("goal_text", description), "actions": actions, "similarity": hit.get("similarity", 1.0)}
 
     def put(self, description: str, actions: List[Dict[str, Any]],
-            site_domain: Optional[str] = None, success_rate: float = 0.8) -> int:
+            success_rate: float = 0.8) -> int:
         return self.repo.put(
             intent_key="SUBGOAL",
             goal_text=description,
             plan_json={"actions": actions},
-            site_domain=site_domain,
             success_rate=success_rate,
             version="subgoal-v1"
-        )
-
-# ------------------------- Subgoal Manifest (goal -> descriptions) ------------
-
-class SubgoalManifestAdapter:
-    """Stores only the list of subgoal descriptions for a goal.
-
-    Backed by PlansRepo with intent_key="SUBGOAL_MANIFEST" and
-    plan_json={"descriptions": ["..."]}.
-    """
-    def __init__(self):
-        self.repo = PlansRepo()
-
-    def get(self, canonical_goal: str, site_domain: Optional[str] = None) -> Optional[list]:
-        hit = self.repo.approx_get(canonical_goal, site_domain=site_domain)
-        if not hit:
-            return None
-        pj = hit.get("plan_json", {})
-        descs = pj.get("descriptions")
-        if isinstance(descs, list) and descs:
-            return descs
-        return None
-
-    def put(self, canonical_goal: str, descriptions: list, site_domain: Optional[str] = None) -> int:
-        return self.repo.put(
-            intent_key="SUBGOAL_MANIFEST",
-            goal_text=canonical_goal,
-            plan_json={"descriptions": descriptions},
-            site_domain=site_domain,
-            success_rate=0.9,
-            version="manifest-v1"
         )

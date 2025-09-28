@@ -16,7 +16,6 @@ from cachedb.db import init_db, get_connection
 from cachedb.repos import AnswersRepo, PlansRepo, LLMRepo
 from cachedb_integrations.cache_adapters import (
     SubgoalStoreAdapter as SubgoalStore,
-    SubgoalManifestAdapter as SubgoalManifest,
     LLMCacheAdapter as LLMCache,
 )
 from cachedb.config import DB_PATH
@@ -26,6 +25,7 @@ from llm_client import LLMClient
 
 # --- Import our core agent
 from agent_core import LLMBrowserAgent, MAX_PAGE_TEXT_CHARS
+from urllib.parse import quote
 
 # ===================== Setup =====================
 load_dotenv()
@@ -35,7 +35,6 @@ answers_repo = AnswersRepo()
 plans_repo = PlansRepo()
 llm_repo = LLMRepo()
 subgoal_store = SubgoalStore()
-subgoal_manifest = SubgoalManifest()
 llm_cache = LLMCache()
 llm_client = LLMClient()
 
@@ -50,41 +49,35 @@ EXECUTION_START_TIME = 0
 TOTAL_EXECUTION_TIME = 0
 
 
-def improved_canonicalize(question: str) -> str:
-    """Neutral canonicalization without hardcoded intent rules.
-    Lowercase and collapse whitespace so only identical questions collide.
-    """
-    q = (question or "")
-    norm = " ".join(q.split()).lower()
-    return f"Q:{norm}"
 
 
-async def _chat_async(messages, temperature=0.0, model_hint="", cache_mode="approx"):
+async def _chat_async(messages, temperature=0.0, model_hint="", bypass_cache=False):
     """Call LLMClient, store in llm_cache, and print token usage with timing"""
 
     start_time = time.time()
 
-    # Check LLM cache first (optional)
-    prompt_text = "\n".join(m["content"] for m in messages)
+    # Check LLM cache first (unless bypassed)
     cached_response = None
-    if cache_mode != "off":
+    if not bypass_cache:
+        prompt_text = "\n".join(m["content"] for m in messages)
         cached_response = llm_cache.approx_get(prompt_text)
-        if cached_response:
-            end_time = time.time()
-            duration = end_time - start_time
-            similarity = cached_response.get("similarity", 1.0)
-            print(f"[LLM CACHE HIT] {llm_client.provider.upper()} {model_hint or 'call'} (sim={similarity:.3f}) - cached response in {duration:.2f}s")
 
-            # Still count tokens for tracking (but they're "free")
-            usage = cached_response.get("usage", {})
-            pt = int(usage.get("prompt_tokens", 0))
-            ct = int(usage.get("completion_tokens", 0))
-            tt = int(usage.get("total_tokens", pt + ct))
-            RUN_TOKENS["prompt"] += 0  # Cached = 0 tokens used
-            RUN_TOKENS["completion"] += 0
-            RUN_TOKENS["total"] += 0
-            print(f"    Cached tokens: prompt={pt} completion={ct} total={tt} (0 tokens charged)")
-            return cached_response["output_text"]
+    if cached_response:
+        end_time = time.time()
+        duration = end_time - start_time
+        similarity = cached_response.get("similarity", 1.0)
+        print(f"[LLM CACHE HIT] {llm_client.provider.upper()} {model_hint or 'call'} (sim={similarity:.3f}) - cached response in {duration:.2f}s")
+
+        # Still count tokens for tracking (but they're "free")
+        usage = cached_response.get("usage", {})
+        pt = int(usage.get("prompt_tokens", 0))
+        ct = int(usage.get("completion_tokens", 0))
+        tt = int(usage.get("total_tokens", pt + ct))
+        RUN_TOKENS["prompt"] += 0  # Cached = 0 tokens used
+        RUN_TOKENS["completion"] += 0
+        RUN_TOKENS["total"] += 0
+        print(f"    Cached tokens: prompt={pt} completion={ct} total={tt} (0 tokens charged)")
+        return cached_response["output_text"]
 
     # Make fresh LLM call
     loop = asyncio.get_event_loop()
@@ -97,13 +90,16 @@ async def _chat_async(messages, temperature=0.0, model_hint="", cache_mode="appr
     end_time = time.time()
     duration = end_time - start_time
 
-    # persist in LLM cache
-    llm_cache.put(
-        model=f"{llm_client.provider}:{os.getenv('OPENAI_MODEL') or 'default'}",
-        prompt=prompt_text,
-        text=text,
-        usage=usage or {"hint": model_hint},
-    )
+    # persist in LLM cache (unless bypassed)
+    if not bypass_cache:
+        if 'prompt_text' not in locals():
+            prompt_text = "\n".join(m["content"] for m in messages)
+        llm_cache.put(
+            model=f"{llm_client.provider}:{os.getenv('OPENAI_MODEL') or 'default'}",
+            prompt=prompt_text,
+            text=text,
+            usage=usage or {"hint": model_hint},
+        )
 
     # tokens
     pt = int(usage.get("prompt_tokens", 0))
@@ -150,7 +146,8 @@ def show_counts(when: str):
 
 def purge_answer_for(goal: str):
     """Remove cached answer for a specific goal."""
-    key = improved_canonicalize(goal)
+    import hashlib
+    key = f"QUERY:unique_{hashlib.md5(goal.lower().encode()).hexdigest()[:8]}"
     print(f"🗑️ Purging cache for: '{goal}' (canonical: '{key}')")
 
     with get_connection() as conn:
@@ -230,7 +227,7 @@ def _print_actions(title: str, subgoals: List[Dict]):
 
 
 def preview_stored_plan(goal: str):
-    hit = plan_store.approx_get(goal, site_domain="wikipedia.org")
+    hit = plans_repo.approx_get(goal)
     if not hit:
         print("\n[PLAN PREVIEW] No stored plan found for this goal (or similar).")
         print("  Tip: run once with --force-plan to create & store a plan.")
@@ -245,8 +242,6 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # If all actions come from subgoal cache, skip LLM extraction
-        self.no_llm_when_cached = True
 
     async def _extract_answer(self, goal: str, all_page_texts: List[str]) -> str:
         """Extract answer from collected page texts using LLM"""
@@ -263,26 +258,13 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
         else:
             combined_text = "\n\n".join(pages)
 
-        # Debug: Print first part of each page content
-        print(f"\n🔍 DEBUG: Extracted content preview:")
-        for i, text in enumerate(all_page_texts, 1):
-            preview = text[:300].replace('\n', ' ')
-            print(f"   Page {i}: {preview}...")
-            # Look for birth dates specifically
-            if "born" in text.lower() or "birth" in text.lower():
-                import re
-                birth_matches = re.findall(r'born[^\.]*\d{4}[^\.]*', text.lower())
-                if birth_matches:
-                    print(f"   -> Found birth info: {birth_matches[0]}")
-
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful assistant that answers questions based ONLY on the provided Wikipedia text. "
+                    "You are a helpful assistant that answers questions based ONLY on the provided Wikipedia content. "
                     "Be concise but thorough. If the information isn't in the provided text, say so clearly. "
-                    "Provide specific dates, facts, and details when available. "
-                    "For comparison questions, look for birth dates in both pieces of content to make the comparison."
+                    "Provide specific dates, facts, and details when available."
                 )
             },
             {
@@ -298,51 +280,85 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
             print(f"❌ Answer extraction failed: {e}")
             return f"Error extracting answer: {e}"
 
-    async def _create_plan(self, goal: str) -> List[Dict]:
-        """Create a new execution plan for the given goal"""
+    async def _create_subgoals(self, goal: str) -> List[Dict]:
+        """Create subgoal descriptions without specific actions"""
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a Wikipedia research planner. Create a plan to answer the user's question using only Wikipedia. "
-                    "Return a JSON array of subgoals, each with a 'description' and 'actions' array. "
-                    "Each action must have this exact format:\n"
-                    "- goto: {\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/PageName\"}\n"
-                    "- read_page: {\"action\": \"read_page\"}\n"
-                    "- scroll: {\"action\": \"scroll\", \"direction\": \"up\" or \"down\"}\n"
-                    "Only use wikipedia.org URLs. Use the actual person/entity names in URLs, not placeholders like PERSON."
+                    "You are a Wikipedia research planner. Break down the user's question into logical subgoals. "
+                    "Return a JSON array of subgoals with only descriptions. Do NOT include actions yet. "
+                    "Focus on what information needs to be gathered, not how to gather it."
                 )
             },
             {
                 "role": "user",
-                "content": f"Create a research plan to answer: {goal}\n\nExample format:\n[\n  {{\n    \"description\": \"Find information about James Blunt\",\n    \"actions\": [\n      {{\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/James_Blunt\"}},\n      {{\"action\": \"read_page\"}}\n    ]\n  }}\n]"
+                "content": f"Break down this research goal into subgoals: {goal}\n\nExample format:\n[\n  {{\"description\": \"Find Chris Martin's birth date\"}},\n  {{\"description\": \"Find Brad Pitt's birth date\"}},\n  {{\"description\": \"Calculate age difference\"}}\n]"
             }
         ]
 
         try:
-            response = await _chat_async(messages, model_hint="create_plan", cache_mode="off")
+            # Bypass LLM cache for subgoal planning to ensure fresh, specific plans
+            response = await _chat_async(messages, model_hint="create_subgoals", bypass_cache=True)
             subgoals = _loose_json_parse(response)
 
             if not isinstance(subgoals, list):
-                raise ValueError("Plan must be a list of subgoals")
+                raise ValueError("Subgoals must be a list")
 
-            # Fix action format if needed
+            # Ensure each subgoal has a description
             for subgoal in subgoals:
-                if "actions" in subgoal:
-                    fixed_actions = []
-                    for action in subgoal["actions"]:
-                        fixed_action = self._normalize_action(action)
-                        if fixed_action:
-                            fixed_actions.append(fixed_action)
-                    subgoal["actions"] = fixed_actions
+                if not isinstance(subgoal, dict) or "description" not in subgoal:
+                    raise ValueError("Each subgoal must have a description")
 
             return subgoals
 
         except Exception as e:
-            print(f"❌ Plan creation failed: {e}")
+            print(f"❌ Subgoal creation failed: {e}")
             return []
 
-    # Removed heuristic/hardcoded extractors; rely on planned subgoals + cached actions.
+    async def _create_actions_for_subgoal(self, subgoal_description: str) -> List[Dict]:
+        """Create specific actions for a single subgoal"""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Wikipedia action planner. For the given subgoal, create specific actions to achieve it. "
+                    "Return a JSON array of actions. Each action must have this exact format:\n"
+                    "- goto: {\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/PageName\"}\n"
+                    "- read_page: {\"action\": \"read_page\"}\n"
+                    "- scroll: {\"action\": \"scroll\", \"direction\": \"up\" or \"down\"}\n"
+                    "Only use Wikipedia URLs (en.wikipedia.org). Use actual names, not placeholders."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Create actions for this subgoal: {subgoal_description}\n\nExample format:\n[\n  {{\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/James_Blunt\"}},\n  {{\"action\": \"read_page\"}}\n]"
+            }
+        ]
+
+        try:
+            # Don't bypass cache for action generation - these can be reused
+            response = await _chat_async(messages, model_hint="create_actions")
+            actions = _loose_json_parse(response)
+
+            if not isinstance(actions, list):
+                raise ValueError("Actions must be a list")
+
+            # Fix action format if needed
+            fixed_actions = []
+            for action in actions:
+                fixed_action = self._normalize_action(action)
+                if fixed_action:
+                    fixed_actions.append(fixed_action)
+
+            return fixed_actions
+
+        except Exception as e:
+            print(f"❌ Action creation failed for subgoal '{subgoal_description}': {e}")
+            return []
+
+
+
 
     async def run(self, goal: str, no_cache=False, plan_preview=False, force_plan=False):
         """Main execution method with robust error handling"""
@@ -359,46 +375,64 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
         if plan_preview:
             preview_stored_plan(goal)
 
-        # Planning phase (no plan-level caching; we’ll cache per subgoal instead)
+        # Planning phase: Two-phase approach for better caching
         print(f"\n📋 PLANNING PHASE")
         print("=" * 60)
 
-        # Zero-LLM path: if we have a subgoal manifest and all subgoals have cached actions, skip planning
-        canonical_goal = improved_canonicalize(goal)
-        manifest = subgoal_manifest.get(canonical_goal, site_domain="wikipedia.org")
-        subgoals = []
-        used_manifest = False
-        if manifest:
-            all_cached = True
-            for desc in manifest:
-                hit = subgoal_store.approx_get(desc, site_domain="wikipedia.org")
-                if not hit:
-                    all_cached = False
-                    break
-            if all_cached:
-                used_manifest = True
-                subgoals = [{"description": d, "actions": subgoal_store.approx_get(d, site_domain="wikipedia.org")["actions"]} for d in manifest]
-                print("📝 [NO-LLM PLAN] Using cached subgoal manifest and actions.")
-
-
-        # Always generate subgoals independent of cache
-        print("📝 [CREATING NEW PLAN]")
-        plan_creation_start = time.time()
-        # Disable LLM cache for planning to avoid unrelated plans
-        subgoals = await self._create_plan(goal)
-        plan_creation_time = time.time() - plan_creation_start
+        # Phase 1: Create subgoal descriptions
+        print("📝 [CREATING SUBGOALS]")
+        subgoal_creation_start = time.time()
+        subgoals = await self._create_subgoals(goal)
+        subgoal_creation_time = time.time() - subgoal_creation_start
         if not subgoals:
-            print("❌ Failed to create plan")
+            print("❌ Failed to create subgoals")
             return
-        _print_actions("New plan actions", subgoals)
-        print(f"📝 [PLAN CREATED] in {plan_creation_time:.3f}s")
-        # Store manifest after plan generation (cache only after generating subgoals)
-        try:
-            descs = [sg.get("description", "") for sg in subgoals if sg.get("description")]
-            if descs:
-                subgoal_manifest.put(canonical_goal, descs, site_domain="wikipedia.org")
-        except Exception as e:
-            print(f"⚠️ Failed to store manifest: {e}")
+        
+        print(f"📝 Generated {len(subgoals)} subgoals:")
+        for i, sg in enumerate(subgoals, 1):
+            print(f"  • Subgoal {i}: {sg.get('description', 'No description')}")
+        print(f"📝 [SUBGOALS CREATED] in {subgoal_creation_time:.3f}s")
+
+        # Phase 2: Get or create actions for each subgoal
+        print(f"\n🔧 ACTION PLANNING PHASE")
+        print("=" * 60)
+        
+        action_planning_start = time.time()
+        for i, subgoal in enumerate(subgoals, 1):
+            desc = subgoal.get("description", "")
+            print(f"\n▶ Planning actions for subgoal {i}: {desc}")
+            
+            # Check if we have cached actions for this subgoal
+            cached_sg = subgoal_store.approx_get(desc)
+            similarity_threshold = 0.75  # Balanced threshold for action reuse
+            
+            if cached_sg and not force_plan and cached_sg.get('similarity', 0) >= similarity_threshold:
+                actions = cached_sg.get("actions", [])
+                print(f"   📦 Using cached actions (sim={cached_sg.get('similarity',1):.3f})")
+                subgoal["actions"] = actions
+            else:
+                if cached_sg:
+                    print(f"   🔍 Found similar subgoal but similarity too low ({cached_sg.get('similarity',0):.3f} < {similarity_threshold})")
+                # Generate new actions for this subgoal
+                print(f"   🔨 Generating new actions...")
+                actions = await self._create_actions_for_subgoal(desc)
+                if actions:
+                    subgoal["actions"] = actions
+                    # Store the new actions in cache
+                    try:
+                        subgoal_store.put(desc, actions, success_rate=0.8)
+                        print(f"   💾 Stored new actions in cache")
+                    except Exception as e:
+                        print(f"   ⚠️ Failed to store actions: {e}")
+                else:
+                    print(f"   ❌ Failed to generate actions for subgoal")
+                    subgoal["actions"] = []
+        
+        action_planning_time = time.time() - action_planning_start
+        print(f"🔧 [ACTION PLANNING COMPLETED] in {action_planning_time:.3f}s")
+        
+        # Print final plan summary
+        _print_actions("Final execution plan", subgoals)
 
         # Execute the plan
         print(f"\n🎬 EXECUTION PHASE")
@@ -406,27 +440,17 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
         execution_start = time.time()
         all_page_texts = []
-
-        all_actions_from_cache = True
         for i, subgoal in enumerate(subgoals, 1):
             subgoal_start = time.time()
-            print(f"\n▶ Subgoal {i}: {subgoal.get('description', 'No description')}")
+            print(f"\n▶ Executing subgoal {i}: {subgoal.get('description', 'No description')}")
 
             # Check browser health before each subgoal
             if not await self.check_browser_health():
                 print(f"❌ Browser connection lost before subgoal {i}")
                 break
 
-            # Subgoal-level cache: try to reuse actions by description
-            desc = subgoal.get("description", "")
-            cached_sg = None if force_plan else subgoal_store.approx_get(desc, site_domain="wikipedia.org")
-            if cached_sg:
-                actions = cached_sg.get("actions", [])
-                cached_desc = cached_sg.get("description", desc)
-                print(f"   📦 Using cached actions for subgoal: '{cached_desc}' (sim={cached_sg.get('similarity',1):.3f})")
-            else:
-                actions = subgoal.get("actions", [])
-                all_actions_from_cache = False
+            # Execute the actions for this subgoal (already planned)
+            actions = subgoal.get("actions", [])
             for j, action in enumerate(actions, 1):
                 action_start = time.time()
                 print(f"   [{j}] EXECUTE {action.get('action', 'unknown')} …")
@@ -452,14 +476,6 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                     print(f"   ❌ Action execution error in {action_time:.3f}s: {e}")
                     continue
 
-            # If no cached actions existed but we executed some, store them now
-            if not cached_sg and actions:
-                try:
-                    subgoal_store.put(desc, actions, site_domain="wikipedia.org", success_rate=0.8)
-                    print("   💾 Stored subgoal actions in cache")
-                except Exception as e:
-                    print(f"   ⚠️ Failed to store subgoal actions: {e}")
-
             subgoal_time = time.time() - subgoal_start
             print(f"   ⏱️ Subgoal {i} completed in {subgoal_time:.3f}s")
 
@@ -472,14 +488,10 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
         if all_page_texts:
             print(f"📖 Extracting answer from {len(all_page_texts)} page(s) of content...")
-            # If we used only cached actions and configured to avoid LLM, skip LLM extraction
-            if all_actions_from_cache and self.no_llm_when_cached:
-                final_answer = "No LLM run (cached-only mode). Add structured extractors if needed."
-            else:
-                extraction_start = time.time()
-                final_answer = await self._extract_answer(goal, all_page_texts)
-                extraction_time = time.time() - extraction_start
-                print(f"🧠 [EXTRACTION COMPLETED] in {extraction_time:.3f}s")
+            extraction_start = time.time()
+            final_answer = await self._extract_answer(goal, all_page_texts)
+            extraction_time = time.time() - extraction_start
+            print(f"🧠 [EXTRACTION COMPLETED] in {extraction_time:.3f}s")
 
             print(f"\n✅ FINAL ANSWER:")
             print("=" * 60)
@@ -539,7 +551,9 @@ async def main():
             if token:
                 try:
                     print("Connecting to Lightpanda browser…")
-                    browser = await p.chromium.connect_over_cdp(f"wss://cloud.lightpanda.io/ws?token={token}")
+                    # browser = await p.chromium.connect_over_cdp(f"wss://cloud.lightpanda.io/ws?token={token}")
+                    browser = await p.chromium.launch(headless=args.headless)
+
                     print("✅ Connected to Lightpanda.")
                 except Exception as e:
                     print("❌ Lightpanda connection failed:", e)

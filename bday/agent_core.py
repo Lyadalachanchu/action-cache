@@ -6,30 +6,8 @@ from urllib.parse import quote_plus
 
 from playwright.async_api import async_playwright
 
-# ===================== Globals =====================
-STRICT_WIKI_ONLY = True
+# ===================== Configuration =====================
 MAX_PAGE_TEXT_CHARS = 100000
-WIKI_HOME = "https://en.wikipedia.org"
-WIKI_SEARCH = WIKI_HOME + "/w/index.php?search="
-
-# Common misnamings → correct canonical titles
-WIKI_TITLE_FIXES = {
-    "Crisis_of_the_Roman_Empire": "Crisis_of_the_Third_Century",
-    "Crisis_of_Roman_Empire": "Crisis_of_the_Third_Century",
-}
-
-def _ensure_wikipedia_url(url: str) -> bool:
-    return "wikipedia.org" in (url or "").lower()
-
-def _normalize_wiki_url(url: str) -> str:
-    if not url:
-        return url
-    if "wikipedia.org" not in url:
-        return url
-    for bad, good in WIKI_TITLE_FIXES.items():
-        if bad in url:
-            return url.replace(bad, good)
-    return url
 
 class LLMBrowserAgent:
     def __init__(self, page=None, browser=None):
@@ -41,7 +19,7 @@ class LLMBrowserAgent:
         self.connection_attempts = 0
         self.max_connection_attempts = 3
 
-    async def safe_page_operation(self, operation_func, *args, max_retries=2, **kwargs):
+    async def safe_page_operation(self, operation_func, *args, max_retries=5, **kwargs):
         """Safely execute page operations with automatic reconnection"""
         for attempt in range(max_retries):
             try:
@@ -140,8 +118,6 @@ class LLMBrowserAgent:
 
     async def _goto_with_retry(self, url: str, retries: int = 2) -> bool:
         """Navigate with retries and automatic reconnection"""
-        url = _normalize_wiki_url(url)
-
         async def goto_operation():
             await self.page.goto(url, wait_until="domcontentloaded")
             await self.page.wait_for_load_state("networkidle")
@@ -156,7 +132,7 @@ class LLMBrowserAgent:
 
     async def _wiki_search(self, query: str) -> bool:
         """Go to Wikipedia search results for query"""
-        search_url = WIKI_SEARCH + quote_plus(query)
+        search_url = f"https://en.wikipedia.org/w/index.php?search={quote_plus(query)}"
         print(f"   → WIKI SEARCH '{query}' ({search_url})")
         return await self._goto_with_retry(search_url)
 
@@ -174,10 +150,10 @@ class LLMBrowserAgent:
 
             if action == "goto":
                 target_url = a.get("url", "")
-                if not _ensure_wikipedia_url(target_url):
+                # Ensure Wikipedia-only navigation
+                if not ("wikipedia.org" in target_url.lower()):
                     print(f"   ❌ BLOCKED: Non-Wikipedia URL: {target_url}")
                     return False
-
                 success = await self._goto_with_retry(target_url)
                 if success:
                     # Get page info AFTER navigation
