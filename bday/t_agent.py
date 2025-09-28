@@ -286,14 +286,16 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
             {
                 "role": "system",
                 "content": (
-                    "You are a Wikipedia research planner. Break down the user's question into logical subgoals. "
+                    "You are a Wikipedia research planner. Break down the user's question into very granular, atomic subgoals. "
+                    "Each subgoal should be a single, specific task that can be accomplished with 1-3 simple actions. "
                     "Return a JSON array of subgoals with only descriptions. Do NOT include actions yet. "
-                    "Focus on what information needs to be gathered, not how to gather it."
+                    "Make subgoals as specific and reusable as possible. "
+                    "Examples of good granular subgoals: 'Navigate to Taylor Swift Wikipedia page', 'Extract birth date from current page', 'Navigate to Grammy Awards page', 'Count Taylor Swift Grammy wins'."
                 )
             },
             {
                 "role": "user",
-                "content": f"Break down this research goal into subgoals: {goal}\n\nExample format:\n[\n  {{\"description\": \"Find Chris Martin's birth date\"}},\n  {{\"description\": \"Find Brad Pitt's birth date\"}},\n  {{\"description\": \"Calculate age difference\"}}\n]"
+                "content": f"Break down this research goal into granular subgoals: {goal}\n\nExample format:\n[\n  {{\"description\": \"Navigate to Taylor Swift Wikipedia page\"}},\n  {{\"description\": \"Extract birth date from Taylor Swift page\"}},\n  {{\"description\": \"Navigate to Beyoncé Wikipedia page\"}},\n  {{\"description\": \"Extract Grammy count from Beyoncé page\"}},\n  {{\"description\": \"Compare the extracted information\"}}\n]"
             }
         ]
 
@@ -327,7 +329,8 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                     "- goto: {\"action\": \"goto\", \"url\": \"https://en.wikipedia.org/wiki/PageName\"}\n"
                     "- read_page: {\"action\": \"read_page\"}\n"
                     "- scroll: {\"action\": \"scroll\", \"direction\": \"up\" or \"down\"}\n"
-                    "Only use Wikipedia URLs (en.wikipedia.org). Use actual names, not placeholders."
+                    "Only use Wikipedia URLs (en.wikipedia.org). Use actual names, not placeholders.\n"
+                    "IMPORTANT: For comparison tasks, do NOT navigate to new pages - the data should already be available from previous subgoals. Use minimal actions like just reading the current page or scrolling."
                 )
             },
             {
@@ -418,12 +421,15 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                 actions = await self._create_actions_for_subgoal(desc)
                 if actions:
                     subgoal["actions"] = actions
-                    # Store the new actions in cache
-                    try:
-                        subgoal_store.put(desc, actions, success_rate=0.8)
-                        print(f"   💾 Stored new actions in cache")
-                    except Exception as e:
-                        print(f"   ⚠️ Failed to store actions: {e}")
+                    # Store the new actions in cache, but avoid caching overly complex sequences
+                    if len(actions) <= 5:  # Only cache simple action sequences
+                        try:
+                            subgoal_store.put(desc, actions, success_rate=0.8)
+                            print(f"   💾 Stored new actions in cache")
+                        except Exception as e:
+                            print(f"   ⚠️ Failed to store actions: {e}")
+                    else:
+                        print(f"   ⚠️ Skipping cache storage - action sequence too complex ({len(actions)} actions)")
                 else:
                     print(f"   ❌ Failed to generate actions for subgoal")
                     subgoal["actions"] = []
