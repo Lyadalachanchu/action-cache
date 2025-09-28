@@ -87,6 +87,7 @@ The system implements a **three-tier caching strategy** to maximize acceleration
 - **LLM Cache**: Stores and reuses LLM responses for similar prompts
 - **Subgoal Cache**: **Core innovation** - Reuses complete action plans for similar research tasks
 - **Answer Cache**: Stores final answers (currently disabled for fresh results)
+- **Cloud Based Database** Stores cache in a structured Weaviates vector database
 
 ### Cache Hit Example
 ```
