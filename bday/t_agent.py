@@ -26,7 +26,6 @@ from llm_client import LLMClient
 
 # --- Import our core agent
 from agent_core import LLMBrowserAgent, MAX_PAGE_TEXT_CHARS
-from urllib.parse import quote
 
 # ===================== Setup =====================
 load_dotenv()
@@ -52,73 +51,12 @@ TOTAL_EXECUTION_TIME = 0
 
 
 def improved_canonicalize(question: str) -> str:
-    """Better canonicalization that properly categorizes different question types"""
-    q = question.lower()
-
-    # Current time/date questions
-    if any(word in q for word in ["current", "today", "now", "what year", "what time", "what date"]):
-        if "year" in q:
-            return "QUERY:current_year"
-        elif "time" in q:
-            return "QUERY:current_time"
-        elif "date" in q:
-            return "QUERY:current_date"
-        else:
-            return "QUERY:current_temporal"
-
-    # Birth date questions
-    if ("when was" in q or "when did" in q) and ("born" in q or "birth" in q):
-        # Extract entity name
-        entity = "UNKNOWN"
-        if "when was" in q and "born" in q:
-            start = q.find("when was") + len("when was")
-            end = q.find("born")
-            if start < end:
-                entity = question[start:end].strip().strip("?").strip()
-
-        if entity != "UNKNOWN":
-            return f"ENTITY:{entity}|ATTR:birth_date"
-        else:
-            return "QUERY:birth_date_unknown_person"
-
-    # Death date questions
-    if ("when did" in q or "when was") and ("die" in q or "death" in q):
-        entity = "UNKNOWN"
-        # Similar extraction logic...
-        if entity != "UNKNOWN":
-            return f"ENTITY:{entity}|ATTR:death_date"
-        else:
-            return "QUERY:death_date_unknown_person"
-
-    # Age questions
-    if "how old" in q:
-        start = q.find("how old is") + len("how old is") if "how old is" in q else q.find("how old") + len("how old")
-        entity = question[start:].strip().strip("?").strip()
-        if entity:
-            return f"ENTITY:{entity}|ATTR:age"
-        else:
-            return "QUERY:age_unknown_person"
-
-    # General information questions
-    if any(start in q for start in ["what is", "what are", "what was", "what were"]):
-        # Extract the main subject
-        subject = q.replace("what is", "").replace("what are", "").replace("what was", "").replace("what were", "").strip("? ")
-        return f"QUERY:what_is_{subject[:30].replace(' ', '_')}"
-
-    # How questions
-    if q.startswith("how"):
-        subject = q.replace("how", "").strip("? ")[:30].replace(" ", "_")
-        return f"QUERY:how_{subject}"
-
-    # Where questions
-    if q.startswith("where"):
-        subject = q.replace("where", "").strip("? ")[:30].replace(" ", "_")
-        return f"QUERY:where_{subject}"
-
-    # Default: use a hash of the question to ensure uniqueness
-    import hashlib
-    question_hash = hashlib.md5(q.encode()).hexdigest()[:8]
-    return f"QUERY:unique_{question_hash}"
+    """Neutral canonicalization without hardcoded intent rules.
+    Lowercase and collapse whitespace so only identical questions collide.
+    """
+    q = (question or "")
+    norm = " ".join(q.split()).lower()
+    return f"Q:{norm}"
 
 
 async def _chat_async(messages, temperature=0.0, model_hint="", cache_mode="approx"):
@@ -404,111 +342,7 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
             print(f"❌ Plan creation failed: {e}")
             return []
 
-    def _heuristic_entities(self, goal: str) -> List[str]:
-        """Very simple entity extraction: sequences of capitalized words or quoted phrases."""
-        g = goal.strip()
-        # Quoted phrases first
-        quoted = re.findall(r"'([^']+)'|\"([^\"]+)\"", g)
-        names = [q[0] or q[1] for q in quoted if (q[0] or q[1])]
-        # Capitalized sequences (skip leading How/What/When/Is/Are)
-        parts = re.findall(r"(?:\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})", g)
-        stop_first = {"How","What","When","Where","Why","Who","Is","Are","Do","Does","Did","Will","Can"}
-        for p in parts:
-            if p.split()[0] in stop_first:
-                continue
-            if p not in names:
-                names.append(p)
-        # Deduplicate while preserving order
-        seen, out = set(), []
-        for n in names:
-            k = n.strip()
-            if k and k not in seen:
-                seen.add(k)
-                out.append(k)
-        return out[:4]
-
-    def _build_heuristic_subgoals(self, goal: str) -> List[Dict[str, Any]]:
-        """Construct minimal subgoals without using LLM."""
-        ents = self._heuristic_entities(goal)
-        subgoals: List[Dict[str, Any]] = []
-        for e in ents:
-            slug = quote(e.replace(" ", "_"))
-            subgoals.append({
-                "description": f"Find information about {e}",
-                "actions": [
-                    {"action": "goto", "url": f"https://en.wikipedia.org/wiki/{slug}"},
-                    {"action": "read_page"}
-                ]
-            })
-        # If comparative/difference question, add a compute subgoal placeholder (no LLM)
-        low = goal.lower()
-        if any(k in low for k in ["how many more", "difference", "older than", "younger than", "compare", "versus", "vs"]):
-            subgoals.append({
-                "description": "Compute comparison based on collected pages",
-                "actions": [
-                    {"action": "scroll", "direction": "up"},
-                    {"action": "scroll", "direction": "down"}
-                ]
-            })
-        return subgoals or []
-
-    def _extract_year(self, text: str) -> Optional[int]:
-        # Prefer YYYY-MM-DD
-        m = re.search(r"(19|20)\d{2}-\d{2}-\d{2}", text)
-        if m:
-            return int(m.group(0)[:4])
-        # Month Day, Year
-        m = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+((19|20)\d{2})", text, re.IGNORECASE)
-        if m:
-            return int(m.group(2))
-        # Born ... 1977 etc.
-        m = re.search(r"\b(19|20)\d{2}\b", text)
-        if m:
-            return int(m.group(0))
-        return None
-
-    def _extract_population(self, text: str) -> Optional[int]:
-        # Look for a population number (largest number after 'population')
-        m_iter = re.finditer(r"population[^\d]*(\d[\d,\.\s]{3,})", text, re.IGNORECASE)
-        best = None
-        for m in m_iter:
-            raw = m.group(1)
-            num = re.sub(r"[^0-9]", "", raw)
-            try:
-                val = int(num)
-                best = max(best or 0, val)
-            except Exception:
-                continue
-        return best
-
-    async def _heuristic_answer(self, goal: str, pages: List[str]) -> Optional[str]:
-        if not pages:
-            return None
-        g = goal.lower()
-        # Age difference between two people
-        if any(k in g for k in ["older than", "younger than", "how much older", "age difference"]):
-            if len(pages) >= 2:
-                y1 = self._extract_year(pages[0])
-                y2 = self._extract_year(pages[1])
-                if y1 and y2:
-                    diff = abs(y1 - y2)
-                    rel = "older" if (y2 and y1 and y2 < y1) else "younger"
-                    return f"Approximate age difference: {diff} years ({rel})."
-        # Population difference between two cities
-        if any(k in g for k in ["how many more people", "population difference", "more people than"]):
-            if len(pages) >= 2:
-                p1 = self._extract_population(pages[0])
-                p2 = self._extract_population(pages[1])
-                if p1 and p2:
-                    return f"Population difference (page1 - page2): {p1 - p2:,}."
-        # How old is X
-        if g.startswith("how old") and pages:
-            y = self._extract_year(pages[0])
-            if y:
-                from datetime import datetime
-                age = datetime.utcnow().year - y
-                return f"Approximate age based on birth year {y}: {age} years."
-        return None
+    # Removed heuristic/hardcoded extractors; rely on planned subgoals + cached actions.
 
     async def run(self, goal: str, no_cache=False, plan_preview=False, force_plan=False):
         """Main execution method with robust error handling"""
@@ -546,20 +380,6 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
                 subgoals = [{"description": d, "actions": subgoal_store.approx_get(d, site_domain="wikipedia.org")["actions"]} for d in manifest]
                 print("📝 [NO-LLM PLAN] Using cached subgoal manifest and actions.")
 
-        if not subgoals:
-            # Fallback: derive subgoal descriptions from goal (cheap heuristic), but DO NOT call LLM
-            # Only accept if all are cached; else, call LLM planner
-            heuristic_descs = [f"Find information about {e}" for e in self._heuristic_entities(goal)]
-            if heuristic_descs:
-                all_cached = True
-                for desc in heuristic_descs:
-                    if not subgoal_store.approx_get(desc, site_domain="wikipedia.org"):
-                        all_cached = False
-                        break
-                if all_cached:
-                    subgoals = [{"description": d, "actions": subgoal_store.approx_get(d, site_domain="wikipedia.org")["actions"]} for d in heuristic_descs]
-                    used_manifest = True
-                    print("📝 [NO-LLM PLAN] Using cached actions for heuristic descriptions.")
 
         # Always generate subgoals independent of cache
         print("📝 [CREATING NEW PLAN]")
@@ -652,12 +472,9 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
 
         if all_page_texts:
             print(f"📖 Extracting answer from {len(all_page_texts)} page(s) of content...")
-            # If we used only cached actions and configured to avoid LLM, try heuristic answer
+            # If we used only cached actions and configured to avoid LLM, skip LLM extraction
             if all_actions_from_cache and self.no_llm_when_cached:
-                final_answer = await self._heuristic_answer(goal, all_page_texts)
-                if not final_answer:
-                    print("   ⚠️ Heuristic extractor could not answer without LLM. Skipping LLM per configuration.")
-                    final_answer = "No LLM run (cached-only mode). Sufficient structured extractors not available for this question."
+                final_answer = "No LLM run (cached-only mode). Add structured extractors if needed."
             else:
                 extraction_start = time.time()
                 final_answer = await self._extract_answer(goal, all_page_texts)
