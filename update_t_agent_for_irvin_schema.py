@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Update t_agent.py to use irvin-style Weaviate schema (Task + Action collections).
+"""
+
+import os
+import weaviate
+import json
+import uuid
+from weaviate.auth import AuthApiKey
+import weaviate.classes.config as wc
+import weaviate.classes.init as wvc
+import weaviate.classes.query as wq
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def connect_to_weaviate():
+    """Connect to Weaviate using irvin branch approach"""
+    weaviate_url = os.getenv("WEAVIATE_URL")
+    weaviate_api_key = os.getenv("WEAVIATE_API_KEY")
+
+    if weaviate_url and weaviate_api_key:
+        try:
+            additional_config = wvc.AdditionalConfig(
+                timeout=wvc.Timeout(init=30)
+            )
+
+            # Get OpenAI API key for vectorization
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            headers = {}
+            if openai_api_key:
+                headers["X-OpenAI-Api-Key"] = openai_api_key
+
+            client = weaviate.connect_to_weaviate_cloud(
+                cluster_url=weaviate_url,
+                auth_credentials=AuthApiKey(weaviate_api_key),
+                additional_config=additional_config,
+                headers=headers,
+                skip_init_checks=True
+            )
+            return client
+        except Exception as e:
+            print(f"Failed to connect to Weaviate Cloud: {e}")
+            return None
+    else:
+        print("No Weaviate Cloud credentials found.")
+        return None
+
+def find_nearest_task_by_text(client, query_text):
+    """Find the nearest Task using vector similarity (irvin style)"""
+    try:
+        Task = client.collections.get("Task")
+        response = Task.query.near_text(
+            query=query_text,
+            limit=1,
+            return_metadata=wq.MetadataQuery(distance=True)
+        )
+        return response
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+def retrieve_task_with_actions(client, task_uuid):
+    """Retrieve a Task with its Actions (irvin style)"""
+    try:
+        Task = client.collections.get("Task")
+        task_response = Task.query.fetch_objects(
+            limit=100,
+            return_references=wq.QueryReference(
+                link_on="actions",
+                return_properties=["name", "description", "parameters_schema"]
+            )
+        )
+
+        # Find the specific task
+        for task in task_response.objects:
+            if str(task.uuid) == str(task_uuid):
+                class MockResponse:
+                    def __init__(self, task_obj):
+                        self.objects = [task_obj]
+                return MockResponse(task)
+        return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+def find_nearest_task_and_actions(client, query_text):
+    """Find the nearest Task and retrieve its Actions (irvin style)"""
+    nearest_tasks = find_nearest_task_by_text(client, query_text)
+
+    if not nearest_tasks or not nearest_tasks.objects:
+        return None
+
+    task = nearest_tasks.objects[0]
+    task_with_actions = retrieve_task_with_actions(client, task.uuid)
+
+    if task_with_actions:
+        return {
+            'task': task,
+            'task_with_actions': task_with_actions,
+            'distance': task.metadata.distance if hasattr(task.metadata, 'distance') else None
+        }
+    return None
+
+def create_task_in_weaviate(client, title, action_names):
+    """Create a task with the given title and actions in Weaviate (irvin style)"""
+    try:
+        # Get existing action UUIDs from the Action collection
+        action_collection = client.collections.get("Action")
+        action_objects = action_collection.query.fetch_objects(limit=100)
+        action_uuids = {}
+        for obj in action_objects.objects:
+            name = obj.properties.get('name')
+            if name:
+                action_uuids[name] = obj.uuid
+
+        # Get the UUIDs for the specified actions
+        action_refs = [action_uuids[name] for name in action_names if name in action_uuids]
+
+        if not action_refs:
+            print(f"⚠️ No valid actions found for task '{title}'")
+            return None
+
+        # Check if task already exists by searching for similar title
+        task_collection = client.collections.get("Task")
+        existing_tasks = task_collection.query.near_text(
+            query=title,
+            limit=1,
+            return_metadata=wq.MetadataQuery(distance=True)
+        )
+
+        # Check if we found an exact match (very high similarity)
+        if existing_tasks.objects and existing_tasks.objects[0].metadata.distance < 0.1:
+            print(f"📦 Task already exists: {title}")
+            return existing_tasks.objects[0].uuid
+
+        # Create the task with a unique UUID
+        task_uuid = task_collection.data.insert(
+            properties={"title": title},
+            references={"actions": action_refs}
+        )
+
+        print(f"✅ Created new task: {title} with {len(action_refs)} actions")
+        return task_uuid
+
+    except Exception as e:
+        print(f"❌ Failed to create task '{title}': {e}")
+        return None
+
+def ensure_collections_exist(client):
+    """Ensure that Task and Action collections exist (irvin style)"""
+    try:
+        # Check if collections exist
+        collections = client.collections.list_all()
+        collection_names = list(collections.keys()) if collections else []
+
+        # Create Action collection if it doesn't exist
+        if "Action" not in collection_names:
+            print("Creating Action collection...")
+            client.collections.create(
+                name="Action",
+                vector_config=wc.Configure.Vectors.self_provided(),
+                properties=[
+                    wc.Property(name="name", data_type=wc.DataType.TEXT, skip_vectorization=True,),
+                    wc.Property(name="description", data_type=wc.DataType.TEXT, skip_vectorization=True,),
+                    wc.Property(name="parameters_schema", data_type=wc.DataType.TEXT, skip_vectorization=True,),
+                ],
+            )
+            print("✅ Action collection created successfully!")
+
+        # Create Task collection if it doesn't exist
+        if "Task" not in collection_names:
+            print("Creating Task collection...")
+            client.collections.create(
+                name="Task",
+                vectorizer_config=wc.Configure.Vectorizer.text2vec_openai(
+                    model="text-embedding-3-large"
+                ),
+                properties=[
+                    wc.Property(name="title", data_type=wc.DataType.TEXT),
+                ],
+                references=[
+                    wc.ReferenceProperty(name="actions", target_collection="Action")
+                ]
+            )
+            print("✅ Task collection created successfully!")
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Error ensuring collections exist: {e}")
+        return False
+
+def test_irvin_schema():
+    """Test the irvin-style schema"""
+    print("🧪 Testing Irvin-Style Schema")
+    print("=" * 40)
+
+    client = connect_to_weaviate()
+    if not client:
+        print("❌ Failed to connect to Weaviate")
+        return False
+
+    try:
+        # Test finding a task
+        print("Testing task search...")
+        result = find_nearest_task_and_actions(client, "Search for celebrity birth date")
+
+        if result:
+            task = result['task']
+            distance = result['distance']
+            print(f"✅ Found task: {task.properties.get('title', 'N/A')}")
+            print(f"   Distance: {distance:.4f}")
+
+            # Test retrieving actions
+            task_with_actions = result['task_with_actions']
+            if task_with_actions and task_with_actions.objects:
+                task_obj = task_with_actions.objects[0]
+                if hasattr(task_obj, 'references') and task_obj.references and 'actions' in task_obj.references:
+                    actions_ref = task_obj.references['actions']
+                    if hasattr(actions_ref, 'objects'):
+                        actions = actions_ref.objects
+                        print(f"   Actions: {len(actions)} found")
+                        for i, action_ref in enumerate(actions, 1):
+                            if hasattr(action_ref, 'properties'):
+                                action_name = action_ref.properties.get('name', 'Unknown')
+                                print(f"     {i}. {action_name}")
+        else:
+            print("❌ No task found")
+
+        # Test creating a new task
+        print("\\nTesting task creation...")
+        new_task_uuid = create_task_in_weaviate(client, "Test task for schema validation", ["goto", "read_page", "done"])
+        if new_task_uuid:
+            print(f"✅ Created test task: {new_task_uuid}")
+        else:
+            print("❌ Failed to create test task")
+
+        client.close()
+        print("\\n✅ Irvin-style schema test completed!")
+        return True
+
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+if __name__ == "__main__":
+    test_irvin_schema()

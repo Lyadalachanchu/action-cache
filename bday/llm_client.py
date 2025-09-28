@@ -35,7 +35,7 @@ class LLMClient:
             return forced
         if os.getenv("LIGHTPANDA_API_KEY"):
             return "lightpanda"
-        if os.getenv("OPENAI_API_KEY"):
+        if os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_TOKEN"):
             return "openai"
         if os.getenv("OPENLLM_BASE_URL"):
             return "openllm"
@@ -76,7 +76,8 @@ class LLMClient:
         # Try SDK first
         try:
             from openai import OpenAI  # pip install openai
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_TOKEN")
+            client = OpenAI(api_key=api_key)
             model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
             resp = client.chat.completions.create(model=model, messages=messages, temperature=temperature)
             text = resp.choices[0].message.content
@@ -91,8 +92,9 @@ class LLMClient:
         except Exception:
             # HTTP fallback
             url = "https://api.openai.com/v1/chat/completions"
+            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_TOKEN")
             headers = {
-                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             }
             payload: Dict[str, Any] = {

@@ -4,31 +4,20 @@ import time
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote_plus
 
-from playwright.async_api import async_playwright, Page, Browser
+from playwright.async_api import async_playwright
 
 # ===================== Configuration =====================
 MAX_PAGE_TEXT_CHARS = 100000
 
 class LLMBrowserAgent:
-    def __init__(self, page: Optional[Page] = None, browser: Optional[Browser] = None):
-        self.page: Optional[Page] = page
-        self.browser: Optional[Browser] = browser
-        self.playwright_context: Any = None
-        self.playwright_instance: Any = None
-        self.token: Optional[str] = None
-        self.use_headless = False
+    def __init__(self, page=None, browser=None):
+        self.page = page
+        self.browser = browser
+        self.playwright_context = None
+        self.token = None
+        # Lightpanda only - no local browser options needed
         self.connection_attempts = 0
         self.max_connection_attempts = 3
-
-    def _require_page(self) -> Page:
-        if self.page is None:
-            raise RuntimeError("Browser page is not available")
-        return self.page
-
-    def _require_browser(self) -> Browser:
-        if self.browser is None:
-            raise RuntimeError("Browser is not available")
-        return self.browser
 
     async def safe_page_operation(self, operation_func, *args, max_retries=5, **kwargs):
         """Safely execute page operations with automatic reconnection"""
@@ -86,31 +75,17 @@ class LLMBrowserAgent:
                     self.browser = await self.playwright_instance.chromium.connect_over_cdp(
                         f"wss://cloud.lightpanda.io/ws?token={self.token}"
                     )
-                    if self.browser is not None:
-                        self.page = await self.browser.new_page()
-                    else:
-                        self.page = None
+                    self.page = await self.browser.new_page()
                     print("✅ Successfully reconnected to Lightpanda")
                     return True
 
                 except Exception as remote_e:
                     print(f"❌ Lightpanda reconnection failed: {remote_e}")
 
-            # Fallback to local browser
-            print("🖥️ Falling back to local browser...")
-            if not self.playwright_context:
-                self.playwright_context = async_playwright()
-                self.playwright_instance = await self.playwright_context.__aenter__()
-
-            self.browser = await self.playwright_instance.chromium.launch(
-                headless=self.use_headless
-            )
-            if self.browser is not None:
-                self.page = await self.browser.new_page()
-            else:
-                self.page = None
-            print("✅ Local browser started successfully")
-            return True
+            # No fallback to local browser - Lightpanda only
+            print("❌ Lightpanda reconnection failed - no local fallback available")
+            print("   Please check your LIGHTPANDA_TOKEN and internet connection")
+            return False
 
         except Exception as e:
             print(f"❌ Browser reconnection failed: {e}")
@@ -119,8 +94,7 @@ class LLMBrowserAgent:
     async def check_browser_health(self):
         """Check if browser is accessible and attempt reconnection if needed"""
         try:
-            page = self._require_page()
-            await page.title()
+            await self.page.title()
             return True
         except Exception as e:
             error_msg = str(e)
@@ -136,11 +110,9 @@ class LLMBrowserAgent:
 
     async def _goto_with_retry(self, url: str, retries: int = 2) -> bool:
         """Navigate with retries and automatic reconnection"""
-        page = self._require_page()
-
         async def goto_operation():
-            await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_load_state("networkidle")
+            await self.page.goto(url, wait_until="domcontentloaded")
+            await self.page.wait_for_load_state("networkidle")
             return True
 
         try:
@@ -159,7 +131,6 @@ class LLMBrowserAgent:
     async def _exec_action(self, a: Dict[str, Any]):
         """Execute a single action with robust error handling"""
         action = a.get("action", "")
-        page = self._require_page()
 
         # Safety check for browser health before any action
         if not await self.check_browser_health():
@@ -179,10 +150,10 @@ class LLMBrowserAgent:
                 if success:
                     # Get page info AFTER navigation
                     try:
-                        title = await self.safe_page_operation(page.title)
-                        current_url = page.url
-                        print(f"   ✅ Navigated to '{title}' ({current_url})")
-                    except Exception:
+                        title = await self.safe_page_operation(self.page.title)
+                        url = self.page.url
+                        print(f"   ✅ Navigated to '{title}' ({url})")
+                    except:
                         print(f"   ✅ Navigated to {target_url}")
                 else:
                     # Try wiki search fallback
@@ -195,16 +166,16 @@ class LLMBrowserAgent:
             elif action == "read_page":
                 # Get current page info
                 try:
-                    title = await self.safe_page_operation(page.title)
-                    current_url = page.url
-                    print(f"   📖 Reading '{title}' ({current_url})")
+                    title = await self.safe_page_operation(self.page.title)
+                    url = self.page.url
+                    print(f"   📖 Reading '{title}' ({url})")
                 except Exception as info_error:
                     print(f"   📖 Reading page (could not get info: {info_error})")
 
                 try:
                     # Get page text safely
                     text_content = await self.safe_page_operation(
-                        lambda: page.evaluate("""
+                        lambda: self.page.evaluate("""
                             () => {
                                 const content = document.querySelector('#mw-content-text, .mw-body-content, #content');
                                 return content ? content.innerText : document.body.innerText;
@@ -226,7 +197,7 @@ class LLMBrowserAgent:
                 direction = a.get("direction", "down")
                 # Get current page info for context
                 try:
-                    title = await self.safe_page_operation(page.title)
+                    title = await self.safe_page_operation(self.page.title)
                     print(f"   🔄 Scrolling {direction} on '{title}'")
                 except:
                     print(f"   🔄 Scrolling {direction}")
@@ -235,7 +206,7 @@ class LLMBrowserAgent:
                     # Use multiple scroll methods for better compatibility
                     if direction == "down":
                         await self.safe_page_operation(
-                            lambda: page.evaluate("""
+                            lambda: self.page.evaluate("""
                                 () => {
                                     if (typeof window.scrollBy === 'function') {
                                         window.scrollBy(0, 500);
@@ -249,7 +220,7 @@ class LLMBrowserAgent:
                         )
                     else:
                         await self.safe_page_operation(
-                            lambda: page.evaluate("""
+                            lambda: self.page.evaluate("""
                                 () => {
                                     if (typeof window.scrollBy === 'function') {
                                         window.scrollBy(0, -500);
@@ -268,9 +239,9 @@ class LLMBrowserAgent:
                     # Fallback to keyboard scrolling
                     try:
                         if direction == "down":
-                            await self.safe_page_operation(lambda: page.keyboard.press("PageDown"))
+                            await self.safe_page_operation(lambda: self.page.keyboard.press("PageDown"))
                         else:
-                            await self.safe_page_operation(lambda: page.keyboard.press("PageUp"))
+                            await self.safe_page_operation(lambda: self.page.keyboard.press("PageUp"))
                         print(f"   → SCROLLED {direction} (keyboard fallback)")
                         return True
                     except Exception as kb_error:
@@ -342,26 +313,7 @@ class LLMBrowserAgent:
     async def cleanup(self):
         """Clean up browser and playwright resources"""
         try:
-            if self.page:
-                await self.page.close()
-        except Exception as e:
-            print(f"⚠️ Page cleanup warning: {e}")
-        finally:
-            self.page = None
-
-        try:
             if self.browser:
                 await self.browser.close()
         except Exception as e:
             print(f"⚠️ Browser cleanup warning: {e}")
-        finally:
-            self.browser = None
-
-        try:
-            if self.playwright_context:
-                await self.playwright_context.__aexit__(None, None, None)
-        except Exception as e:
-            print(f"⚠️ Playwright cleanup warning: {e}")
-        finally:
-            self.playwright_context = None
-            self.playwright_instance = None
