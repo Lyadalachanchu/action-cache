@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Fixed Weaviate Service that properly creates Task-Action relationships
-Matches the existing database schema with references
+Updated Weaviate Service for existing database schema
+Works with Action and Task collections as defined in create_collections.py
 """
 
 import os
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class WeaviateService:
-    """Service class for Weaviate operations with proper Task-Action relationships"""
+    """Service class for Weaviate operations with existing schema"""
     
     def __init__(self):
         self.client = None
@@ -78,80 +78,25 @@ class WeaviateService:
             self.tasks_collection = None
             self.actions_collection = None
     
-    def get_action_by_name(self, action_name):
-        """Get an action by its name"""
-        if not self.is_connected or not self.actions_collection:
+    def save_task(self, task_data):
+        """Save a task to Weaviate using existing schema"""
+        if not self.is_connected or not self.tasks_collection:
+            print("⚠️  Weaviate not available - skipping task save")
             return None
         
         try:
-            # Fetch all actions and filter by name
-            response = self.actions_collection.query.fetch_objects(limit=100)
-            for obj in response.objects:
-                if obj.properties.get('name') == action_name:
-                    return obj
-            return None
-        except Exception as e:
-            print(f"❌ Failed to get action by name: {e}")
-            return None
-    
-    def create_task_with_actions(self, title, action_names):
-        """Create a task with specific actions using proper references"""
-        if not self.is_connected or not self.tasks_collection or not self.actions_collection:
-            print("⚠️  Weaviate not available - cannot create task")
-            return None
-        
-        try:
-            # Get action UUIDs for the specified action names
-            action_uuids = []
-            for action_name in action_names:
-                action_obj = self.get_action_by_name(action_name)
-                if action_obj:
-                    action_uuids.append(action_obj.uuid)
-                    print(f"   ✅ Found action: {action_name}")
-                else:
-                    print(f"   ⚠️  Action '{action_name}' not found in database")
+            # Prepare data for Weaviate (matching existing schema)
+            weaviate_data = {
+                "title": task_data.get("title", "")
+            }
             
-            if not action_uuids:
-                print("❌ No valid actions found")
-                return None
-            
-            # Create the task with action references
-            result = self.tasks_collection.data.insert(
-                properties={"title": title},
-                references={"actions": action_uuids}
-            )
-            
-            print(f"💾 Created task: {title} with {len(action_uuids)} actions (ID: {result})")
+            # Insert into collection
+            result = self.tasks_collection.data.insert(weaviate_data)
+            print(f"💾 Saved task: {task_data.get('title', 'Unknown')} (ID: {result})")
             return result
             
         except Exception as e:
-            print(f"❌ Failed to create task with actions: {e}")
-            return None
-    
-    def save_subtask_with_actions(self, subtask_data):
-        """Save a subtask with its actions using proper Task-Action relationships"""
-        if not self.is_connected or not self.tasks_collection or not self.actions_collection:
-            print("⚠️  Weaviate not available - skipping subtask save")
-            return None
-        
-        try:
-            title = subtask_data.get("title", "")
-            actions = subtask_data.get("actions", [])
-            
-            # Extract action names from the actions list
-            action_names = []
-            for action in actions:
-                if isinstance(action, dict) and "action" in action:
-                    action_names.append(action["action"])
-                elif isinstance(action, str):
-                    action_names.append(action)
-            
-            # Create task with proper action references
-            result = self.create_task_with_actions(title, action_names)
-            return result
-            
-        except Exception as e:
-            print(f"❌ Failed to save subtask with actions: {e}")
+            print(f"❌ Failed to save task: {e}")
             return None
     
     def search_similar_tasks(self, query, limit=5, similarity_threshold=0.7):
@@ -188,37 +133,25 @@ class WeaviateService:
             print(f"❌ Failed to search similar tasks: {e}")
             return []
     
-    def get_task_with_actions(self, task_id):
-        """Get a task with its associated actions"""
+    def get_task_by_id(self, task_id):
+        """Get a specific task by ID"""
         if not self.is_connected or not self.tasks_collection:
             return None
         
         try:
-            # Get the task
-            task_response = self.tasks_collection.query.fetch_object_by_id(task_id)
-            if not task_response:
-                return None
-            
-            # Get the task's actions via references
-            actions = []
-            if hasattr(task_response, 'references') and task_response.references and 'actions' in task_response.references:
-                for action_ref in task_response.references['actions']:
-                    # Get the action details
-                    action_response = self.actions_collection.query.fetch_object_by_id(action_ref)
-                    if action_response:
-                        actions.append({
-                            "name": action_response.properties.get('name', ''),
-                            "description": action_response.properties.get('description', ''),
-                            "parameters_schema": action_response.properties.get('parameters_schema', '{}')
-                        })
-            
-            return {
-                "title": task_response.properties.get('title', ''),
-                "actions": actions
-            }
+            response = self.tasks_collection.query.fetch_object_by_id(task_id)
+            if response:
+                return {
+                    "task": response.properties.get('title', ''),
+                    "actions": [],
+                    "description": response.properties.get('title', ''),
+                    "user_goal": "",
+                    "subgoal_id": 0
+                }
+            return None
             
         except Exception as e:
-            print(f"❌ Failed to get task with actions: {e}")
+            print(f"❌ Failed to get task by ID: {e}")
             return None
     
     def get_available_actions(self):
@@ -242,6 +175,38 @@ class WeaviateService:
         except Exception as e:
             print(f"❌ Failed to get actions: {e}")
             return []
+    
+    def create_task_with_actions(self, title, action_names):
+        """Create a task with specific actions"""
+        if not self.is_connected or not self.tasks_collection or not self.actions_collection:
+            print("⚠️  Weaviate not available - cannot create task")
+            return None
+        
+        try:
+            # Get all available actions
+            available_actions = self.get_available_actions()
+            action_map = {action['name']: action['uuid'] for action in available_actions}
+            
+            # Get UUIDs for requested actions
+            action_uuids = []
+            for action_name in action_names:
+                if action_name in action_map:
+                    action_uuids.append(action_map[action_name])
+                else:
+                    print(f"⚠️  Action '{action_name}' not found in database")
+            
+            # Create the task with action references
+            result = self.tasks_collection.data.insert(
+                properties={"title": title},
+                references={"actions": action_uuids}
+            )
+            
+            print(f"💾 Created task: {title} with {len(action_uuids)} actions (ID: {result})")
+            return result
+            
+        except Exception as e:
+            print(f"❌ Failed to create task with actions: {e}")
+            return None
     
     def close(self):
         """Close Weaviate connection"""

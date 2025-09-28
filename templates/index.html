@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Weaviate Agent - Question Search & Analysis</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        .search-section {
+            padding: 30px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .search-form {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .search-input {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .search-input:focus {
+            outline: none;
+            border-color: #4facfe;
+        }
+        
+        .search-btn {
+            padding: 15px 30px;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .search-btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .search-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .results-section {
+            padding: 30px;
+        }
+        
+        .thinking-card {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-left: 4px solid #4facfe;
+        }
+        
+        .similarity-card {
+            background: #fff3cd;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .execution-card {
+            background: #d1ecf1;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-left: 4px solid #17a2b8;
+        }
+        
+        .card-title {
+            font-size: 1.3em;
+            font-weight: bold;
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .similarity-item {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
+        }
+        
+        .similarity-score {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        
+        .score-high { background: #d4edda; color: #155724; }
+        .score-medium { background: #fff3cd; color: #856404; }
+        .score-low { background: #f8d7da; color: #721c24; }
+        
+        .execution-step {
+            background: white;
+            padding: 10px 15px;
+            margin: 5px 0;
+            border-radius: 5px;
+            border-left: 3px solid #17a2b8;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #4facfe;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        .status-online { background: #28a745; }
+        .status-offline { background: #dc3545; }
+        
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧠 Weaviate Agent</h1>
+            <p>Question Search & Analysis with AI Thinking Process</p>
+        </div>
+        
+        <div class="search-section">
+            <div class="search-form">
+                <input type="text" id="questionInput" class="search-input" 
+                       placeholder="Ask a question (e.g., 'Who is older, Chris Martin or Matt Damon?')"
+                       value="Who is older, Chris Martin or Matt Damon?">
+                <button id="searchBtn" class="search-btn">🔍 Analyze Question</button>
+            </div>
+            
+            <div id="statusIndicator">
+                <span class="status-indicator status-offline" id="statusDot"></span>
+                <span id="statusText">Checking Weaviate connection...</span>
+            </div>
+        </div>
+        
+        <div class="results-section">
+            <div id="results" class="hidden">
+                <!-- Results will be populated here -->
+            </div>
+            
+            <div id="loading" class="loading hidden">
+                <div class="spinner"></div>
+                <p>Analyzing question and checking for similar patterns...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const searchBtn = document.getElementById('searchBtn');
+        const questionInput = document.getElementById('questionInput');
+        const resultsDiv = document.getElementById('results');
+        const loadingDiv = document.getElementById('loading');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+
+        // Check Weaviate status on page load
+        window.addEventListener('load', checkStatus);
+
+        async function checkStatus() {
+            try {
+                const response = await fetch('/history');
+                const data = await response.json();
+                
+                if (data.weaviate_status) {
+                    statusDot.className = 'status-indicator status-online';
+                    statusText.textContent = 'Weaviate connected - Ready for analysis';
+                } else {
+                    statusDot.className = 'status-indicator status-offline';
+                    statusText.textContent = 'Weaviate offline - Limited functionality';
+                }
+            } catch (error) {
+                statusDot.className = 'status-indicator status-offline';
+                statusText.textContent = 'Connection error - Please check server';
+            }
+        }
+
+        searchBtn.addEventListener('click', handleSearch);
+        questionInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                handleSearch();
+            }
+        });
+
+        async function handleSearch() {
+            const question = questionInput.value.trim();
+            if (!question) {
+                alert('Please enter a question');
+                return;
+            }
+
+            // Show loading
+            loadingDiv.classList.remove('hidden');
+            resultsDiv.classList.add('hidden');
+            searchBtn.disabled = true;
+            searchBtn.textContent = 'Analyzing...';
+
+            try {
+                const response = await fetch('/search', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ question: question })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    displayResults(data);
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (error) {
+                alert('Search failed: ' + error.message);
+            } finally {
+                loadingDiv.classList.add('hidden');
+                searchBtn.disabled = false;
+                searchBtn.textContent = '🔍 Analyze Question';
+            }
+        }
+
+        function displayResults(data) {
+            resultsDiv.innerHTML = `
+                <div class="thinking-card">
+                    <div class="card-title">🧠 AI Thinking Process</div>
+                    <p><strong>Question:</strong> ${data.question}</p>
+                    <p><strong>Analysis:</strong> ${data.thinking_process.similarity_reasoning || 'No reasoning available'}</p>
+                    <p><strong>Task Saved:</strong> ${data.thinking_process.task_saved || 'Not saved'}</p>
+                    <p><strong>Timestamp:</strong> ${new Date(data.timestamp).toLocaleString()}</p>
+                </div>
+
+                <div class="similarity-card">
+                    <div class="card-title">🔍 Similarity Analysis</div>
+                    <p><strong>Found Similar Tasks:</strong> ${data.similarity_analysis.found_similar ? 'Yes' : 'No'}</p>
+                    <p><strong>Reuse Decision:</strong> ${data.similarity_analysis.reuse_decision || 'Unknown'}</p>
+                    
+                    ${data.similarity_analysis.similar_tasks && data.similarity_analysis.similar_tasks.length > 0 ? `
+                        <h4>Similar Tasks Found:</h4>
+                        ${data.similarity_analysis.similar_tasks.map(task => `
+                            <div class="similarity-item">
+                                <strong>${task.task}</strong>
+                                <span class="similarity-score ${getScoreClass(task.similarity)}">
+                                    ${(task.similarity * 100).toFixed(1)}% similar
+                                </span>
+                                <p><em>${task.description}</em></p>
+                            </div>
+                        `).join('')}
+                    ` : '<p>No similar tasks found in database.</p>'}
+                </div>
+
+                <div class="execution-card">
+                    <div class="card-title">⚡ Execution Plan</div>
+                    <p><strong>Plan Type:</strong> ${data.execution_plan.type}</p>
+                    <p><strong>Estimated Time:</strong> ${data.execution_plan.estimated_time}</p>
+                    <p><strong>Confidence:</strong> ${data.execution_plan.confidence}</p>
+                    
+                    <h4>Execution Steps:</h4>
+                    ${data.execution_plan.steps.map(step => `
+                        <div class="execution-step">${step}</div>
+                    `).join('')}
+                </div>
+            `;
+
+            resultsDiv.classList.remove('hidden');
+        }
+
+        function getScoreClass(score) {
+            if (score >= 0.8) return 'score-high';
+            if (score >= 0.6) return 'score-medium';
+            return 'score-low';
+        }
+    </script>
+</body>
+</html>

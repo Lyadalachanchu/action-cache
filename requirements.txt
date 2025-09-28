@@ -3,6 +3,7 @@ openai>=1.109.1
 playwright>=1.55.0
 python-dotenv>=1.1.1
 requests>=2.32.5
+flask>=2.3.0
 
 # Weaviate and vector database
 weaviate-client>=4.17.0

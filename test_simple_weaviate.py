@@ -21,14 +21,14 @@ async def test_simple_weaviate():
         # Test saving a task
         test_task = {
             "title": "Simple test task",
-            "description": "This is a simple test",
-            "id": 1,
-            "user_goal": "Test goal",
-            "success_rate": 0.9
+            "actions": [
+                {"action": "read_page"},
+                {"action": "done"}
+            ]
         }
         
         print("💾 Testing task save...")
-        result = service.save_task(test_task)
+        result = service.save_subtask_with_actions(test_task)
         if result:
             print(f"✅ Task saved with ID: {result}")
         else:
