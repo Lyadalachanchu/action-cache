@@ -602,7 +602,8 @@ class ExtendedLLMBrowserAgent(LLMBrowserAgent):
             cached_sg = None if force_plan else subgoal_store.approx_get(desc, site_domain="wikipedia.org")
             if cached_sg:
                 actions = cached_sg.get("actions", [])
-                print(f"   📦 Using cached actions for subgoal (sim={cached_sg.get('similarity',1):.3f})")
+                cached_desc = cached_sg.get("description", desc)
+                print(f"   📦 Using cached actions for subgoal: '{cached_desc}' (sim={cached_sg.get('similarity',1):.3f})")
             else:
                 actions = subgoal.get("actions", [])
                 all_actions_from_cache = False
