@@ -557,8 +557,9 @@ async def main():
             if token:
                 try:
                     print("Connecting to Lightpanda browser…")
-                    # browser = await p.chromium.connect_over_cdp(f"wss://cloud.lightpanda.io/ws?token={token}")
-                    browser = await p.chromium.launch(headless=args.headless)
+                    browser = await p.chromium.connect_over_cdp(
+                        f"wss://cloud.lightpanda.io/ws?token={token}"
+                    )
 
                     print("✅ Connected to Lightpanda.")
                 except Exception as e:
