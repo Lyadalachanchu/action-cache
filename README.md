@@ -2,6 +2,8 @@
 
 A **concept demonstration** of how intelligent caching can dramatically accelerate browser automation agents by storing and reusing action plans, eliminating the need for repeated LLM "thinking" about common tasks.
 
+Main files are in /bday
+
 ## Core Concept
 
 Instead of having the LLM plan every action from scratch, this system:
