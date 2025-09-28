@@ -134,15 +134,27 @@ def create_task_in_weaviate(client, title, action_names):
             print(f"⚠️ No valid actions found for task '{title}'")
             return None
         
-        # Create the task
+        # Check if task already exists by searching for similar title
         task_collection = client.collections.get("Task")
-        task_uuid = task_collection.data.insert(
-            properties={"title": title},
-            references={"actions": action_refs},
-            uuid=uuid.uuid5(uuid.NAMESPACE_URL, f"task:{title.lower().replace(' ', '_')}:v1").hex
+        existing_tasks = task_collection.query.near_text(
+            query=title,
+            limit=1,
+            return_metadata=wq.MetadataQuery(distance=True)
         )
         
-        print(f"✅ Created task: {title} with {len(action_refs)} actions")
+        # Check if we found an exact match (very high similarity)
+        if existing_tasks.objects and existing_tasks.objects[0].metadata.distance < 0.1:
+            print(f"📦 Task already exists: {title}")
+            return existing_tasks.objects[0].uuid
+        
+        # Create the task with a unique UUID
+        task_uuid = task_collection.data.insert(
+            properties={"title": title},
+            references={"actions": action_refs}
+            # Let Weaviate generate a unique UUID instead of using deterministic one
+        )
+        
+        print(f"✅ Created new task: {title} with {len(action_refs)} actions")
         return task_uuid
         
     except Exception as e:

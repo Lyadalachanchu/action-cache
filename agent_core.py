@@ -15,7 +15,7 @@ class LLMBrowserAgent:
         self.browser = browser
         self.playwright_context = None
         self.token = None
-        self.use_headless = False
+        # Lightpanda only - no local browser options needed
         self.connection_attempts = 0
         self.max_connection_attempts = 3
 
@@ -82,18 +82,10 @@ class LLMBrowserAgent:
                 except Exception as remote_e:
                     print(f"❌ Lightpanda reconnection failed: {remote_e}")
 
-            # Fallback to local browser
-            print("🖥️ Falling back to local browser...")
-            if not self.playwright_context:
-                self.playwright_context = async_playwright()
-                self.playwright_instance = await self.playwright_context.__aenter__()
-
-            self.browser = await self.playwright_instance.chromium.launch(
-                headless=self.use_headless
-            )
-            self.page = await self.browser.new_page()
-            print("✅ Local browser started successfully")
-            return True
+            # No fallback to local browser - Lightpanda only
+            print("❌ Lightpanda reconnection failed - no local fallback available")
+            print("   Please check your LIGHTPANDA_TOKEN and internet connection")
+            return False
 
         except Exception as e:
             print(f"❌ Browser reconnection failed: {e}")

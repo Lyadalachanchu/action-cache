@@ -44,9 +44,6 @@ RUN_TOKENS = {"prompt": 0, "completion": 0, "total": 0}
 EXECUTION_START_TIME = 0
 TOTAL_EXECUTION_TIME = 0
 
-
-
-
 async def _chat_async(messages, temperature=0.0, model_hint="", bypass_cache=False):
     """Call LLMClient and print token usage with timing (cache functionality removed)"""
 
@@ -589,7 +586,7 @@ async def main():
     ap.add_argument("--purge", action="store_true", help="Purge cached answer for the given goal")
     ap.add_argument("--emergency-purge", action="store_true", help="Emergency purge of obviously wrong cached answers")
     ap.add_argument("--show-counts", action="store_true", help="Print DB table counts before/after")
-    ap.add_argument("--headless", action="store_true", help="Run Lightpanda in headless mode")
+    # --headless argument removed - Lightpanda cloud browser is always used
     args = ap.parse_args()
 
     goal = " ".join(args.goal).strip() if args.goal else "When was Marie Curie born?"
@@ -632,7 +629,6 @@ async def main():
 
             # Create agent with browser references
             agent = ExtendedLLMBrowserAgent(page=page, browser=browser)
-            agent.use_headless = args.headless
             agent.token = token
             agent.playwright_context = p
             agent.playwright_instance = p
